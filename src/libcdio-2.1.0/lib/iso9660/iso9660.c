@@ -800,10 +800,11 @@ iso9660_dir_init_new (void *dir,
                       uint32_t psize,
                       const time_t *dir_timeS,
                       const time_t *dir_timeP,
-                      int timezone)
+                      int timezoneS,
+                      int timezoneP)
 {
   iso9660_dir_init_new_su (dir, self, ssize, NULL, 0, parent, psize, NULL,
-                           0, dir_timeS, dir_timeP, timezone);
+                           0, dir_timeS, dir_timeP, timezoneS, timezoneP);
 }
 
 void
@@ -818,7 +819,8 @@ iso9660_dir_init_new_su (void *dir,
                          unsigned int psu_size,
                          const time_t *dir_timeS,
                          const time_t *dir_timeP,
-                         int timezone)
+                         int timezoneS,
+                         int timezoneP)
 {
   cdio_assert (ssize > 0 && !(ssize % ISO_BLOCKSIZE));
   cdio_assert (psize > 0 && !(psize % ISO_BLOCKSIZE));
@@ -828,10 +830,10 @@ iso9660_dir_init_new_su (void *dir,
 
   /* "\0" -- working hack due to padding  */
   iso9660_dir_add_entry_su (dir, "\0", self, ssize, ISO_DIRECTORY, ssu_data,
-                            ssu_size, dir_timeS, timezone);
+                            ssu_size, dir_timeS, timezoneS);
 
   iso9660_dir_add_entry_su (dir, "\1", parent, psize, ISO_DIRECTORY, psu_data,
-                            psu_size, dir_timeP, timezone);
+                            psu_size, dir_timeP, timezoneP);
 }
 
 /* Zero's out pathable. Do this first.  */
