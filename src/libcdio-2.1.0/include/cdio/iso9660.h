@@ -536,6 +536,7 @@ struct iso9660_stat_s { /* big endian!! */
   lsn_t              lsn;             /**< start logical sector number */
   uint32_t           size;            /**< total size in bytes */
   uint32_t           secsize;         /**< number of sectors allocated */
+  int16_t            timezone;        /**< timezone */
   iso9660_xa_t       xa;              /**< XA attributes */
   enum { _STAT_HIDDEN = 1, _STAT_VISIBLE = 0 } hidden;
   enum { _STAT_FILE = 1, _STAT_DIR = 2 } type;
@@ -860,7 +861,8 @@ iso9660_dir_init_new (void *dir, uint32_t self, uint32_t ssize,
                       uint32_t parent, uint32_t psize,
                       const time_t *dir_timeS,
                       const time_t *dir_timeP,
-                      int timezone);
+                      int timezoneS,
+                      int timezoneP);
 
 void
 iso9660_dir_init_new_su (void *dir, uint32_t self, uint32_t ssize,
@@ -869,7 +871,8 @@ iso9660_dir_init_new_su (void *dir, uint32_t self, uint32_t ssize,
                          const void *psu_data, unsigned int psu_size,
                          const time_t *dir_timeS,
                          const time_t *dir_timeP,
-                         int timezone);
+                         int timezoneS,
+                         int timezoneP);
 
 void
 iso9660_dir_add_entry_su (void *dir, const char filename[], uint32_t extent,
