@@ -36,21 +36,27 @@ extern "C" {
 using boost::format;
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <regex>
 #include <string>
+#include <sstream>
 #include <time.h>
 #include <vector>
 using namespace std;
 
 
-#define TOOL_VERSION "PSXRip 2.0"
+#define TOOL_VERSION "PSXRip 2.0.1 Final"
 #define timegm _mkgmtime
 
+// base64 encoded cue file
+string cueFileEncoded = "";
+
 // Y2k / root entry processing error
-string rootEntryReplacementStr;
+struct tm rootEntryReplacementTm;
 
 // Audio sector counter
 int audioSectors = 0;
@@ -62,21 +68,69 @@ int gmtValueParent = 0;
 // Sector buffer
 static char buffer[M2RAW_SECTOR_SIZE];
 
+// Identify type of postgap
+int track1PostgapType;
+
+// Gzip compress and Base64 encode text string
+std::string base64_encode(const std::string& input) {
+	const std::string base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+	std::string base64EncodedContent;
+	size_t i = 0;
+	size_t j = 0;
+	uint8_t charArray3[3];
+	uint8_t charArray4[4];
+
+	for (uint8_t byte : input) {
+		charArray3[i++] = byte;
+		if (i == 3) {
+			charArray4[0] = (charArray3[0] & 0xfc) >> 2;
+			charArray4[1] = ((charArray3[0] & 0x03) << 4) + ((charArray3[1] & 0xf0) >> 4);
+			charArray4[2] = ((charArray3[1] & 0x0f) << 2) + ((charArray3[2] & 0xc0) >> 6);
+			charArray4[3] = charArray3[2] & 0x3f;
+
+			for (i = 0; i < 4; ++i) {
+				base64EncodedContent += base64Chars[charArray4[i]];
+			}
+			i = 0;
+		}
+	}
+
+	if (i) {
+		for (j = i; j < 3; ++j) {
+			charArray3[j] = '\0';
+		}
+
+		charArray4[0] = (charArray3[0] & 0xfc) >> 2;
+		charArray4[1] = ((charArray3[0] & 0x03) << 4) + ((charArray3[1] & 0xf0) >> 4);
+		charArray4[2] = ((charArray3[1] & 0x0f) << 2) + ((charArray3[2] & 0xc0) >> 6);
+
+		for (j = 0; j < i + 1; ++j) {
+			base64EncodedContent += base64Chars[charArray4[j]];
+		}
+
+		while (i++ < 3) {
+			base64EncodedContent += '=';
+		}
+	}
+
+	return base64EncodedContent;
+}
 
 // To hex function.
 std::string toHexString(const uint8_t* data, const size_t size) {
-    std::string hex_str;
-    hex_str.reserve(size * 2); // reserve enough space to avoid reallocations
+	std::string hex_str;
+	hex_str.reserve(size * 2); // reserve enough space to avoid reallocations
 
-    static const char hex_chars[] = "0123456789ABCDEF";
+	static const char hex_chars[] = "0123456789ABCDEF";
 
-    for (size_t i = 0; i < size; i++) {
-        uint8_t byte = data[i];
-        hex_str.push_back(hex_chars[byte >> 4]);
-        hex_str.push_back(hex_chars[byte & 0x0F]);
-    }
+	for (size_t i = 0; i < size; i++) {
+		uint8_t byte = data[i];
+		hex_str.push_back(hex_chars[byte >> 4]);
+		hex_str.push_back(hex_chars[byte & 0x0F]);
+	}
 
-    return hex_str;
+	return hex_str;
 }
 
 // Print an ISO long-format time structure to a file.
@@ -99,9 +153,20 @@ static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_t
 		gmtValue = l.lt_gmtoff; // Change the global gmtValue if not 0. But only for the creation date.
 	}
 	
+	if (creation_time == true) {
+	rootEntryReplacementTm.tm_year = std::stoi(year_str);
+	rootEntryReplacementTm.tm_mon = std::stoi(month_str)-1;
+	rootEntryReplacementTm.tm_mday = std::stoi(day_str);
+	rootEntryReplacementTm.tm_hour = std::stoi(hour_str);
+	rootEntryReplacementTm.tm_min = std::stoi(minute_str);
+	rootEntryReplacementTm.tm_sec = std::stoi(second_str);
+	}
+
 	if (century_str == "00" && std::stoi(day_str) >= 1) {
 		century_str = "20";
-		rootEntryReplacementStr = century_str + year_str + month_str + day_str + hour_str + minute_str + second_str;
+		if (creation_time == true) { 
+			rootEntryReplacementTm.tm_year = std::stoi(year_str) + 100;
+		}
 	}
 	
 	f << format("%.2s%.2s-%.2s-%.2s %.2s:%.2s:%.2s.%.2s %d")
@@ -114,24 +179,24 @@ static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_t
 // Dump system area data from image to file.
 static void dumpSystemArea(CdIo_t *image, const boost::filesystem::path &fileName)
 {
-  ofstream file(fileName.generic_string(), ofstream::out | ofstream::binary | ofstream::trunc);
-  if (!file) {
-    throw runtime_error((format("Cannot create system area file %1%\n") % fileName).str());
-  }
+	ofstream file(fileName.generic_string(), ofstream::out | ofstream::binary | ofstream::trunc);
+	if (!file) {
+		throw runtime_error((format("Cannot create system area file %1%\n") % fileName).str());
+	}
 
-  const size_t numSystemAreaSectors = 16;
-  for (size_t sector = 0; sector < numSystemAreaSectors; ++sector) {
-    char buffer[CDIO_CD_FRAMESIZE_RAW];
-    driver_return_code_t r = cdio_read_audio_sectors(image, buffer, sector, 1);
-    if (r != DRIVER_OP_SUCCESS) {
-      throw runtime_error((format("Error reading sector %1% of image file: %2%") % sector % cdio_driver_errmsg(r)).str());
-    }
+	const size_t numSystemAreaSectors = 16;
+	for (size_t sector = 0; sector < numSystemAreaSectors; ++sector) {
+		char buffer[CDIO_CD_FRAMESIZE_RAW];
+		driver_return_code_t r = cdio_read_audio_sectors(image, buffer, sector, 1);
+		if (r != DRIVER_OP_SUCCESS) {
+			throw runtime_error((format("Error reading sector %1% of image file: %2%") % sector % cdio_driver_errmsg(r)).str());
+		}
 
-    file.write(buffer, CDIO_CD_FRAMESIZE_RAW);
-    if (!file) {
-      throw runtime_error((format("Cannot write to system area file %1%") % fileName).str());
-    }
-  }
+		file.write(buffer, CDIO_CD_FRAMESIZE_RAW);
+		if (!file) {
+			throw runtime_error((format("Cannot write to system area file %1%") % fileName).str());
+		}
+	}
 }
 
 // Functor for sorting a container of iso9660_stat_t pointers by LSN
@@ -145,7 +210,7 @@ struct CmpByLSN {
 
 // Recursively dump the contents of the ISO filesystem starting at 'dir'
 // while extending the catalog file.
-static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, bool writeGUADs,
+static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 						   const boost::filesystem::path & outputPath, const string & inputPath = "",
 						   const string & dirName = "", unsigned level = 0)
 {
@@ -164,28 +229,48 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 	// Open the catalog record for the directory
 	CdioListNode_t *node = _cdio_list_begin(entries);
 
-	char evaluateYear[5];
 	time_t directoryEpochSelf, directoryEpochParent;
 	char datestringSelf[32], datestringParent[32];
 
 	// Process first directory entry "."
 	iso9660_stat_t *statSelf = static_cast<iso9660_stat_t *>(_cdio_list_node_data(node));
-	if (snprintf(evaluateYear, sizeof(evaluateYear), "%d", statSelf->tm.tm_year), std::string(evaluateYear).length() < 2 || std::string(evaluateYear).length() > 3 || std::stoi(std::string(evaluateYear)) < 70) {
-		strncpy(datestringSelf, rootEntryReplacementStr.c_str(), sizeof(datestringSelf));
+	// Fix broken Y2K dates and the mess libcdio makes with that.
+	if (statSelf->tm.tm_year < 90 || statSelf->tm.tm_year > 130) {
+		if (statSelf->tm.tm_year < 10) {
+			statSelf->tm.tm_year = statSelf->tm.tm_year + 100;
+		} else {
+			statSelf->tm.tm_year = rootEntryReplacementTm.tm_year;
+			statSelf->tm.tm_mon = rootEntryReplacementTm.tm_mon;
+			statSelf->tm.tm_mday = rootEntryReplacementTm.tm_mday;
+			statSelf->tm.tm_sec = rootEntryReplacementTm.tm_sec;
+			statSelf->tm.tm_min = rootEntryReplacementTm.tm_min;
+			statSelf->tm.tm_hour = rootEntryReplacementTm.tm_hour;
+		}
+		strftime(datestringSelf, sizeof(datestringSelf), "%Y%m%d%H%M%S", &statSelf->tm);
 	} else {
-	directoryEpochSelf = timegm(&statSelf->tm); 
-	directoryEpochSelf = directoryEpochSelf + (statSelf->timezone * 15 * 60);
-	tm* time_info_self = gmtime(&directoryEpochSelf);
-	struct tm time_info_val_self = *time_info_self;
-	strftime(datestringSelf, sizeof(datestringSelf), "%Y%m%d%H%M%S", &time_info_val_self);
+		directoryEpochSelf = timegm(&statSelf->tm); 
+		directoryEpochSelf = directoryEpochSelf + (statSelf->timezone * 15 * 60);
+		tm* time_info_self = gmtime(&directoryEpochSelf);
+		struct tm time_info_val_self = *time_info_self;
+		strftime(datestringSelf, sizeof(datestringSelf), "%Y%m%d%H%M%S", &time_info_val_self);
 	}
 
 	node = _cdio_list_node_next(node);
 
 	// Process second directory entry ".."
 	iso9660_stat_t *statParent = static_cast<iso9660_stat_t *>(_cdio_list_node_data(node));
-	if (snprintf(evaluateYear, sizeof(evaluateYear), "%d", statParent->tm.tm_year), std::string(evaluateYear).length() < 2 || std::string(evaluateYear).length() > 3 || std::stoi(std::string(evaluateYear)) < 70) {
-	strncpy(datestringParent, rootEntryReplacementStr.c_str(), sizeof(datestringParent));
+	if (statParent->tm.tm_year < 90 || statParent->tm.tm_year > 130) {
+		if (statParent->tm.tm_year < 10) {
+			statParent->tm.tm_year = statParent->tm.tm_year + 100;
+		} else {
+			statParent->tm.tm_year = rootEntryReplacementTm.tm_year;
+			statParent->tm.tm_mon = rootEntryReplacementTm.tm_mon;
+			statParent->tm.tm_mday = rootEntryReplacementTm.tm_mday;
+			statParent->tm.tm_sec = rootEntryReplacementTm.tm_sec;
+			statParent->tm.tm_min = rootEntryReplacementTm.tm_min;
+			statParent->tm.tm_hour = rootEntryReplacementTm.tm_hour;
+		}
+		strftime(datestringParent, sizeof(datestringParent), "%Y%m%d%H%M%S", &statParent->tm);
 	} else {
 		directoryEpochParent = timegm(&statParent->tm); 
 		directoryEpochParent = directoryEpochParent + (statParent->timezone * 15 * 60);
@@ -199,32 +284,30 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 		if (writeLBNs) {
 			catalog << " @" << statSelf->lsn;
 		}
-		if (writeGUADs) {
-			catalog << " GID" << _byteswap_ushort(statSelf->xa.group_id);
-			catalog << " UID" << _byteswap_ushort(statSelf->xa.user_id);
-			catalog << " ATR" << _byteswap_ushort(statSelf->xa.attributes);
-			catalog << " DATES" << datestringSelf;
-			catalog << " DATEP" << datestringParent;
-			catalog << " TIMEZONES" << std::to_string(statSelf->timezone);
-			catalog << " TIMEZONEP" << std::to_string(statParent->timezone);
-			catalog << " HIDDEN" << statSelf->hidden;
-		}
+		catalog << " GID" << _byteswap_ushort(statSelf->xa.group_id);
+		catalog << " UID" << _byteswap_ushort(statSelf->xa.user_id);
+		catalog << " ATRS" << _byteswap_ushort(statSelf->xa.attributes);
+		catalog << " ATRP" << _byteswap_ushort(statParent->xa.attributes);
+		catalog << " DATES" << datestringSelf;
+		catalog << " DATEP" << datestringParent;
+		catalog << " TIMEZONES" << std::to_string(statSelf->timezone);
+		catalog << " TIMEZONEP" << std::to_string(statParent->timezone);
+		catalog << " HIDDEN" << statSelf->hidden;
 		catalog << " {\n";
 	} else {
 		catalog << string(level * 2, ' ') << "dir " << dirName;
 		if (writeLBNs) {
 			catalog << " @" << statSelf->lsn;
 		}
-		if (writeGUADs) {
-			catalog << " GID" << _byteswap_ushort(statSelf->xa.group_id);
-			catalog << " UID" << _byteswap_ushort(statSelf->xa.user_id);
-			catalog << " ATR" << _byteswap_ushort(statSelf->xa.attributes);
-			catalog << " DATES" << datestringSelf;
-			catalog << " DATEP" << datestringParent;
-			catalog << " TIMEZONES" << std::to_string(statSelf->timezone);
-			catalog << " TIMEZONEP" << std::to_string(statParent->timezone);
-			catalog << " HIDDEN" << statSelf->hidden;
-		}
+		catalog << " GID" << _byteswap_ushort(statSelf->xa.group_id);
+		catalog << " UID" << _byteswap_ushort(statSelf->xa.user_id);
+		catalog << " ATRS" << _byteswap_ushort(statSelf->xa.attributes);
+		catalog << " ATRP" << _byteswap_ushort(statParent->xa.attributes);
+		catalog << " DATES" << datestringSelf;
+		catalog << " DATEP" << datestringParent;
+		catalog << " TIMEZONES" << std::to_string(statSelf->timezone);
+		catalog << " TIMEZONEP" << std::to_string(statParent->timezone);
+		catalog << " HIDDEN" << statSelf->hidden;
 		catalog << " {\n";
 	}
 
@@ -255,8 +338,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 
 			// Entry is a directory, recurse into it unless it is "." or ".."
 			if (entryName != "." && entryName != "..") {
-				// std::cout << "Parsing: " << stat2->filename << " - " << fileDate << std::endl; // Debug
-				dumpFilesystem(image, catalog, writeLBNs, writeGUADs, outputDirName, entryPath, entryName, level + 1);
+				dumpFilesystem(image, catalog, writeLBNs, outputDirName, entryPath, entryName, level + 1);
 			}
 
 		} else {
@@ -297,16 +379,13 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 			if (writeLBNs || cddaFile) {
 				catalog << " @" << stat->lsn;
 			}
-			if (writeGUADs) {
-				catalog << " GID" << _byteswap_ushort(stat->xa.group_id);
-				catalog << " UID" << _byteswap_ushort(stat->xa.user_id);
-				catalog << " ATR" << _byteswap_ushort(stat->xa.attributes);
-				catalog << " DATE" << datestringEntry;
-				catalog << " TIMEZONE" << std::to_string(stat->timezone);
-				catalog << " HIDDEN" << stat->hidden;
-				catalog << " SIZE" << stat->size;
-			}
-			catalog << " \n";
+			catalog << " GID" << _byteswap_ushort(stat->xa.group_id);
+			catalog << " UID" << _byteswap_ushort(stat->xa.user_id);
+			catalog << " ATR" << _byteswap_ushort(stat->xa.attributes);
+			catalog << " DATE" << datestringEntry;
+			catalog << " TIMEZONE" << std::to_string(stat->timezone);
+			catalog << " SIZE" << stat->size;
+			catalog << " HIDDEN" << stat->hidden;
 
 			// Dump the file contents
 			boost::filesystem::path outputFileName = outputDirName / entryName;
@@ -316,13 +395,26 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 			}
 
 			size_t sizeRemaining = fileSize;
+			
+			char bufferTest[CDIO_CD_FRAMESIZE_RAW];
+			bool edcTest = false;
 
-			for (lsn_t sector = 0; sector < stat->secsize; ++sector) {
+			for (uint32_t sector = 0; sector < stat->secsize; ++sector) {
 				memset(buffer, 0, blockSize);
+				memset(bufferTest, 0, CDIO_CD_FRAMESIZE_RAW);
 
 				driver_return_code_t r;
+				driver_return_code_t rTest;
 				if (form2File) {
 					r = cdio_read_mode2_sector(image, buffer, stat->lsn + sector, true);
+					rTest = cdio_read_audio_sectors(image, bufferTest, stat->lsn + sector, true);
+					if (rTest != DRIVER_OP_SUCCESS) {
+						cerr << format("Error reading sector %1% of image file: %2%") % (stat->lsn + sector) % cdio_driver_errmsg(r) << endl;
+						cerr << format("Output file %1% may be incomplete") % outputFileName << endl;
+					}
+					if ((bufferTest[18] & 0x20) == 0x20 && bufferTest[2348] == '\0' && bufferTest[2349] == '\0' && bufferTest[2350] == '\0' &&	bufferTest[2351] == '\0') {
+						edcTest = true;
+					}
 				} else {
 					r = cdio_read_data_sectors(image, buffer, stat->lsn + sector, blockSize, 1);
 				}
@@ -341,6 +433,13 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 
 				sizeRemaining -= sizeToWrite;
 			}
+			if (edcTest == true && form2File) {
+			 	catalog << " ZEROEDC" << "1";
+			 	edcTest = false;
+			} else if (form2File) {
+			 	catalog << " ZEROEDC" << "0";
+			}
+			catalog << " \n";
 			file.close();
 		}
 	}
@@ -353,7 +452,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs, b
 
 
 // Dump image to system area data, catalog file, and output directory.
-static void dumpImage(CdIo_t * image, const boost::filesystem::path & outputPath, bool writeLBNs, bool writeGUADs, int postgapSectors, int postgapType)
+static void dumpImage(CdIo_t * image, const boost::filesystem::path & outputPath, bool writeLBNs, int track1PostgapSectors, int track1PostgapType, int track1SectorCount)
 {
 	// Read ISO volume information
 	iso9660_pvd_t pvd;
@@ -399,8 +498,10 @@ static void dumpImage(CdIo_t * image, const boost::filesystem::path & outputPath
 	catalog << "  modification_date "; print_ltime(catalog, pvd.modification_date);
 	catalog << "  expiration_date "; print_ltime(catalog, pvd.expiration_date);
 	catalog << "  effective_date "; print_ltime(catalog, pvd.effective_date);
-	catalog << "  postgap_sectors " << postgapSectors << "\n";
-	catalog << "  postgap_type " << postgapType << "\n";
+	catalog << "  original_cue_file [" << cueFileEncoded << "]\n";
+	catalog << "  track1_sector_count " << track1SectorCount << "\n";
+	catalog << "  track1_postgap_sectors " << track1PostgapSectors << "\n";
+	catalog << "  track1_postgap_type " << track1PostgapType << "\n";
 	catalog << "  audio_sectors " << audioSectors << "\n";
 	catalog << "}\n\n";
 
@@ -410,7 +511,7 @@ static void dumpImage(CdIo_t * image, const boost::filesystem::path & outputPath
 	}
 
 	cout << "Dumping filesystem to directory " << outputPath << "...\n";
-	dumpFilesystem(image, catalog, writeLBNs, writeGUADs, outputPath);
+	dumpFilesystem(image, catalog, writeLBNs, outputPath);
 
 	// Close down
 	cout << "Catalog written to " << catalogName << "\n";
@@ -492,7 +593,6 @@ static void usage(const char * progname, int exitcode = 0, const string & error 
 {
 	cout << "Usage: " << boost::filesystem::path(progname).filename().generic_string() << " [OPTION...] <input>[.bin/cue] [<output_dir>]" << endl;
 	cout << "  -l, --lbns                      Write LBNs to catalog file" << endl;
-	cout << "  -g, --guads                     Write GIDs, UIDs, ATTRibutes and the DATEs to catalog file" << endl;
 	cout << "  -t, --lbn-table                 Print LBN table and exit" << endl;
 	cout << "  -v, --verbose                   Be verbose" << endl;
 	cout << "  -V, --version                   Display version information and exit" << endl;
@@ -513,7 +613,6 @@ int main(int argc, const char ** argv)
 	boost::filesystem::path inputPath;
 	boost::filesystem::path outputPath;
 	bool writeLBNs = false;
-	bool writeGUADs = false;
 	bool printLBNTable = false;
 
 	for (int i = 1; i < argc; ++i) {
@@ -524,8 +623,6 @@ int main(int argc, const char ** argv)
 			return 0;
 		} else if (arg == "--lbns" || arg == "-l") {
 			writeLBNs = true;
-		} else if (arg == "--guads" || arg == "-g") {
-			writeGUADs = true;
 		} else if (arg == "--lbn-table" || arg == "-t") {
 			printLBNTable = true;
 		} else if (arg == "--verbose" || arg == "-v") {
@@ -561,7 +658,19 @@ int main(int argc, const char ** argv)
 			inputPath.replace_extension(".bin");
 		}
 
+		// Open the cue file and encode in base64 string.
+		std::string filePath = inputPath.string();
+		std::ifstream file(filePath);
+		std::stringstream buffer;
+		buffer << file.rdbuf();
+		std::string cueContent = buffer.str();
+		file.close();
+
+		// Base64 encode the entire content
+		cueFileEncoded = base64_encode(cueContent);
+
 		// HACK! Since libcdio has issues with mixed cd's in the bin/cue format and i can't find the problem.
+		// It keeps on finding only 150 sectors (postgap size?) and fails extracting when audio is present.
 		// This strips the audio component of the cue file and have it process.
 		boost::filesystem::path backupFile = inputPath;
 		backupFile.replace_extension(inputPath.extension().string() + ".original");
@@ -615,13 +724,10 @@ int main(int argc, const char ** argv)
 		// Get postgap sector count of track 1
 		msf_t msfTrack1;
 		cdio_get_track_msf(image, 1, &msfTrack1);
-		int postgapSectors = msfTrack1.m * CDIO_CD_SECS_PER_MIN * CDIO_CD_FRAMES_PER_SEC + msfTrack1.s * CDIO_CD_FRAMES_PER_SEC + msfTrack1.f;
-		cdio_info("Postgap sectors: %d", postgapSectors);
+		int track1PostgapSectors = msfTrack1.m * CDIO_CD_SECS_PER_MIN * CDIO_CD_FRAMES_PER_SEC + msfTrack1.s * CDIO_CD_FRAMES_PER_SEC + msfTrack1.f;
+		cdio_info("Track 1 postgap sectors: %d", track1PostgapSectors);
 		
-		// Identify type of postgap
-		int postgapType;
-		
-		if (postgapSectors > 1) {
+		if (track1PostgapSectors > 1) {
 			char postGapBuffer[CDIO_CD_FRAMESIZE_RAW];
 			driver_return_code_t r = cdio_read_audio_sectors(image, postGapBuffer, (last_lsnTrack1 - 1), 1);
 			if (r != DRIVER_OP_SUCCESS) {
@@ -629,20 +735,20 @@ int main(int argc, const char ** argv)
 			}
 			std::regex postgapType1("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000000000000000(00)*$"); // Empty
 			std::regex postgapType2("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000200000002000(00)*$"); // Mode2
-			std::regex postgapType3("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000200000002000(00)*([0-9a-f]{8})$"); // Mode2 with EDC
+			std::regex postgapType3("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000200000002000(00)*([0-9A-F]){8}$"); // Mode2 with EDC
 			std::vector<uint8_t> postGapVector(postGapBuffer, postGapBuffer + CDIO_CD_FRAMESIZE_RAW);
 			std::string postGapHex = toHexString(postGapVector.data(), postGapVector.size());
 
 			if (std::regex_match(postGapHex, postgapType1)) {
-				postgapType = 1;
+				track1PostgapType = 1;
 			} else if (std::regex_match(postGapHex, postgapType2)) {
-				postgapType = 2;
+				track1PostgapType = 2;
 			} else if (std::regex_match(postGapHex, postgapType3)) {
-				postgapType = 3;
+				track1PostgapType = 3;
 			} else {
-				postgapType = 0; // Unknown, possibly dump it raw. Need to write that.
+				track1PostgapType = 0; // Unknown, possibly dump it raw. Need to write that.
 			}
-			cdio_info("Postgap type: %d", postgapType);
+			cdio_info("Track 1 postgap type: %d", track1PostgapType);
 		}
 		
 		// Get the number of tracks and total sector sizes of each track including pregap/postgap
@@ -679,7 +785,7 @@ int main(int argc, const char ** argv)
 			size = file.tellg();
 			sectors = size / CDIO_CD_FRAMESIZE_RAW;
 			file.close();
-			std::cout << "Number of sectors in " << binFileWithoutPath << ": " << sectors << std::endl;
+			cdio_info((std::string("Number of sectors in ") + binFileWithoutPath + ": %d").c_str(), sectors);
 
 			if (trackNumber > 1) {
 				audioSectors += sectors;
@@ -734,7 +840,7 @@ int main(int argc, const char ** argv)
 		} else {
 
 			// Dump the input image
-			dumpImage(image, outputPath, writeLBNs, writeGUADs, postgapSectors, postgapType);
+			dumpImage(image, outputPath, writeLBNs, track1PostgapSectors, track1PostgapType, last_lsnTrack1);
 		}
 
 		// Close the input image
