@@ -18,8 +18,6 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
 //
 
-#include <string.h>  // memset()
-
 #include <cdio/cdio.h>
 #include <cdio/iso9660.h>
 #include <cdio/bytesex.h>
@@ -28,10 +26,8 @@ extern "C" {
 #include <libvcd/sector.h>
 }
 
-#include <string.h>
-#include <time.h>
-
 #include <algorithm>
+#include <cstring>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -41,20 +37,32 @@ extern "C" {
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <iterator>
 #include <queue>
 #include <ranges>
 #include <regex>
+#include <stdexcept>
 #include <string>
+#include <time.h>
 #include <vector>
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXBuild 2.2"
-
+#define TOOL_VERSION "PSXBuild v2.2.1 (Win32 by ^Ripper)"
+#ifdef _WIN32
+    #define timegm _mkgmtime
+#endif
 
 struct FileNode;
 struct DirNode;
 
+int audioSectors = 0;
+int track1SectorCount = 0;
+int track1SectorCountOffset = 0;
+int track1PostgapSectors = 0;
+int track1PostgapType = 0;
+int timeZone = 0;
+std::string original_cue_file = "";
 
 // Mode 2 raw sector buffer
 static char buffer[CDIO_CD_FRAMESIZE_RAW];
@@ -65,6 +73,36 @@ static const uint8_t emptySector[M2F2_SECTOR_SIZE] = {0};
 // Maximum number of sectors in an image
 const uint32_t MAX_ISO_SECTORS = 74 * 60 * 75;  // 74 minutes
 
+// Decode Base64 to string
+std::string base64_decode(const std::string& encodedContent) {
+	const std::string base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+	std::string decodedContent;
+	size_t i = 0;
+	uint8_t charArray4[4];
+
+	for (char c : encodedContent) {
+		if (c == '=') {
+			break;
+		}
+
+		charArray4[i++] = static_cast<uint8_t>(base64Chars.find(c));
+		if (i == 4) {
+			decodedContent += static_cast<char>((charArray4[0] << 2) | ((charArray4[1] & 0x30) >> 4));
+			decodedContent += static_cast<char>(((charArray4[1] & 0x0F) << 4) | ((charArray4[2] & 0x3C) >> 2));
+			decodedContent += static_cast<char>(((charArray4[2] & 0x03) << 6) | charArray4[3]);
+			i = 0;
+		}
+	}
+
+	return decodedContent;
+}
+
+
+// Check for .DA audio tracks.
+bool isDA(const std::string& str) {
+	return str.find(".DA;1") != std::string::npos;
+}
 
 // Convert string to integer.
 static bool str_to_num(const string & s, auto & value)
@@ -189,8 +227,8 @@ struct CmpByName {
 
 // File (leaf) node
 struct FileNode : public FSNode {
-	FileNode(const string & name_, const fs::path & path_, DirNode * parent_, uint32_t startSector_ = 0, bool isForm2_ = false)
-		: FSNode(name_, path_, parent_, startSector_), isForm2(isForm2_)
+	FileNode(const string & name_, const fs::path & path_, DirNode * parent_, uint32_t startSector_ = 0, bool isForm2_ = false, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, string nodeDate_ = "", int16_t nodeTimezone_ = 0, uint32_t nodeSize_ = 0, bool nodeHidden_ = false, bool nodeEDC_ = false)
+		: FSNode(name_, path_, parent_, startSector_), isForm2(isForm2_), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeDate(nodeDate_), nodeTimezone(nodeTimezone_), nodeSize(nodeSize_), nodeHidden(nodeHidden_), nodeEDC(nodeEDC_)
 	{
 		// Check for the existence of the file and obtain its size
 		size = fs::file_size(path);
@@ -199,10 +237,21 @@ struct FileNode : public FSNode {
 		size_t blockSize = isForm2 ? M2RAW_SECTOR_SIZE : ISO_BLOCKSIZE;
 		numSectors = (size + blockSize - 1) / blockSize;
 
-		if (numSectors == 0) {
+		if (numSectors == 0 && !isDA(name_)) { // Disable sector count for CDDA.
 			numSectors = 1;  // empty files use one sector
 		}
 	}
+
+	// The list
+	uint16_t nodeGID;
+	uint16_t nodeUID;
+	uint16_t nodeATR;
+	string nodeDate;
+	string dirDateParent;
+	int16_t nodeTimezone;
+	uint32_t nodeSize;
+	bool nodeHidden;
+	bool nodeEDC;
 
 	// Size in bytes
 	uint32_t size;
@@ -216,8 +265,19 @@ struct FileNode : public FSNode {
 
 // Directory node
 struct DirNode : public FSNode {
-	DirNode(const string & name_, const fs::path & path_, DirNode * parent_ = NULL, uint32_t startSector_ = 0)
-		: FSNode(name_, path_, parent_, startSector_), data(NULL), recordNumber(0) { }
+	DirNode(const string & name_, const fs::path & path_, DirNode * parent_ = NULL, uint32_t startSector_ = 0, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, uint16_t nodeATRP_ = 0, string nodeDate_ = "", string dirDateParent_ = "", int16_t nodeTimezone_ = 0, int16_t nodeTimezoneParent_ = 0, bool nodeHidden_ = false)
+		: FSNode(name_, path_, parent_, startSector_), data(NULL), recordNumber(0), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeATRP(nodeATRP_), nodeDate(nodeDate_), dirDateParent(dirDateParent_), nodeTimezone(nodeTimezone_), nodeTimezoneParent(nodeTimezoneParent_), nodeHidden(nodeHidden_) { }
+
+	// The list
+	uint16_t nodeGID;
+	uint16_t nodeUID;
+	uint16_t nodeATR;
+	uint16_t nodeATRP;
+	string nodeDate;
+	string dirDateParent;
+	int16_t nodeTimezone;
+	int16_t nodeTimezoneParent;
+	bool nodeHidden;
 
 	// Pointer to directory extent data
 	uint8_t * data;
@@ -366,6 +426,30 @@ static void checkFileName(const string & s, const string & description)
 }
 
 
+static void convertToEpochTime(const std::string& date, time_t& epoch_time) {
+	std::string new_date = date;
+	if (new_date.substr(0, 2) == "00") { // the Y2K / 00 hex for year issue on some ISO's.
+	  if (std::stoi(new_date.substr(2, 2)) > 90) {
+			new_date.replace(0, 2, "19");
+		} else {
+			new_date.replace(0, 2, "20");
+		}
+	}
+
+	tm time_info{};
+	int year, month, day, hour, min, sec;
+
+	sscanf(new_date.c_str(), "%04d%02d%02d%02d%02d%02d", &year, &month, &day, &hour, &min, &sec);
+	time_info.tm_year = year - 1900;
+	time_info.tm_mon = month - 1;
+	time_info.tm_mday = day;
+	time_info.tm_hour = hour;
+	time_info.tm_min = min;
+	time_info.tm_sec = sec;
+
+	epoch_time = timegm(&time_info);
+}
+
 // Check that the given string represents a valid sector number and
 // convert it to an integer. Returns 0 if the string is empty;
 static uint32_t checkLBN(const string & s, const string & itemName)
@@ -435,6 +519,11 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 		static const regex modificationDateSpec("modification_date\\s*(.*)");
 		static const regex expirationDateSpec("expiration_date\\s*(.*)");
 		static const regex effectiveDateSpec("effective_date\\s*(.*)");
+		static const regex original_cue_fileSpec("original_cue_file\\s*\\[(.*)\\]");
+		static const regex track1SectorCountSpec("track1_sector_count\\s*(\\d+)");
+		static const regex track1PostgapSectorsSpec("track1_postgap_sectors\\s*(\\d+)");
+		static const regex track1PostgapTypeSpec("track1_postgap_type\\s*(\\d+)");
+		static const regex audioSectorsSpec("audio_sectors\\s*(\\d+)");
 		static const regex defaultUIDSpec("default_uid\\s*(\\d+)");
 		static const regex defaultGIDSpec("default_gid\\s*(\\d+)");
 		smatch m;
@@ -502,6 +591,9 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 
 			// Creation date specification
 			parse_ltime(m[1], cat.creationDate);
+			
+			// Get the timezone offset. Offset is in 15 minutes increments, so 36 means 9 hours.
+			timeZone = std::stoi(std::to_string(cat.creationDate.lt_gmtoff));
 
 		} else if (regex_match(line, m, modificationDateSpec)) {
 
@@ -517,6 +609,31 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 
 			// Effective date specification
 			parse_ltime(m[1], cat.effectiveDate);
+
+		} else if (regex_match(line, m, original_cue_fileSpec)) {
+
+			// Original cue file
+			original_cue_file = base64_decode(m[1].str());
+
+		} else if (regex_match(line, m, track1SectorCountSpec)) {
+			if (! str_to_num(m[1], track1SectorCount)) {
+				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
+			}
+
+		} else if (regex_match(line, m, track1PostgapSectorsSpec)) {
+			if (! str_to_num(m[1], track1PostgapSectors)) {
+				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
+			}
+
+		} else if (regex_match(line, m, track1PostgapTypeSpec)) {
+			if (! str_to_num(m[1], track1PostgapType)) {
+				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
+			}
+
+		} else if (regex_match(line, m, audioSectorsSpec)) {
+			if (! str_to_num(m[1], audioSectors)) {
+				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
+			}
 
 		} else if (regex_match(line, m, defaultUIDSpec)) {
 
@@ -540,19 +657,33 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 
 
 // Recursively parse a "dir" section of the catalog file.
-static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & dirName, const fs::path & path, DirNode * parent = NULL, uint32_t startSector = 0)
+static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & dirName, const fs::path & path, DirNode * parent = NULL, uint32_t startSector = 0, uint16_t nodeGID = 0, uint16_t nodeUID = 0, uint16_t nodeATR = 0, uint16_t nodeATRP = 0, string nodeDate = "", string dirDateParent = "", int16_t nodeTimezone = 0, int16_t nodeTimezoneParent = 0, bool nodeHidden = false)
 {
-	DirNode * dir = new DirNode(dirName, path, parent, startSector);
+	DirNode * dir = new DirNode(dirName, path, parent, startSector, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, dirDateParent, nodeTimezone, nodeTimezoneParent, nodeHidden);
 
 	while (true) {
+		// Reset everything on each itteration.
+		nodeGID = 0;
+		nodeUID = 0;
+		nodeATR = 0;
+		nodeATRP = 0;
+		nodeDate = "";
+		dirDateParent = "";
+		nodeTimezone = 0;
+		nodeTimezoneParent = 0;
+		uint32_t nodeSize = 0;
+		nodeHidden = false;
+		bool nodeEDC = false;
+
 		string line = nextline(catalogFile);
 		if (line.empty()) {
 			throw runtime_error(format("Syntax error in catalog file: unterminated directory section \"{}\"", dirName));
 		}
 
-		static const regex fileSpec("file\\s*(\\S+)(?:\\s*@(\\d+))?");
-		static const regex xaFileSpec("xafile\\s*(\\S+)(?:\\s*@(\\d+))?");
-		static const regex dirStart("dir\\s*(\\S+)(?:\\s*@(\\d+))?\\s*\\{");
+		static const regex fileSpec        ("file\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?");
+		static const regex xaFileSpec    ("xafile\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*ZEROEDC(\\d+))?");
+		static const regex cddaFileSpec("cddafile\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?");
+		static const regex dirStart         ("dir\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATRS(\\d+))?(?:\\s*ATRP(\\d+))?(?:\\s*DATES(\\d*))?(?:\\s*DATEP(\\d*))?(?:\\s*TIMEZONES(\\d+))?(?:\\s*TIMEZONEP(\\d+))?(?:\\s*HIDDEN(\\d+))?\\s*\\{");
 		smatch m;
 
 		if (line == "}") {
@@ -564,33 +695,83 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 
 			// File specification
 			string fileName = m[1];
+			if (!std::string(m[3]).empty() && !std::string(m[4]).empty() && !std::string(m[5]).empty() && !std::string(m[6]).empty()) {
+				nodeGID = std::stoi(m[3]);
+				nodeUID = std::stoi(m[4]);
+				nodeATR = std::stoi(m[5]);
+				nodeDate = m[6];
+				nodeTimezone = std::stoi(m[7]);
+				nodeSize = std::stoi(m[8]);
+				nodeHidden = std::stoi(m[9]);
+			}
 			checkFileName(fileName, "file name");
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, false, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, false);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, xaFileSpec)) {
 
 			// XA file specification
 			string fileName = m[1];
+			if (!std::string(m[3]).empty() && !std::string(m[4]).empty() && !std::string(m[5]).empty() && !std::string(m[6]).empty()) {
+				nodeGID = std::stoi(m[3]);
+				nodeUID = std::stoi(m[4]);
+				nodeATR = std::stoi(m[5]);
+				nodeDate = m[6];
+				nodeTimezone = std::stoi(m[7]);
+				nodeSize = std::stoi(m[8]);
+				nodeHidden = std::stoi(m[9]);
+				nodeEDC = std::stoi(m[10]);
+			}
 			checkFileName(fileName, "file name");
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeEDC);
+			dir->children.push_back(file);
+
+		} else if (regex_match(line, m, cddaFileSpec)) {
+
+			// CDDA file specification
+			string fileName = m[1];
+			if (!std::string(m[3]).empty() && !std::string(m[4]).empty() && !std::string(m[5]).empty() && !std::string(m[6]).empty()) {
+				nodeGID = std::stoi(m[3]);
+				nodeUID = std::stoi(m[4]);
+				nodeATR = std::stoi(m[5]);
+				nodeDate = m[6];
+				nodeTimezone = std::stoi(m[7]);
+				nodeSize = std::stoi(m[8]);
+				nodeHidden = std::stoi(m[9]);
+			}
+			checkFileName(fileName, "file name");
+
+			uint32_t startSector = checkLBN(m[2], fileName);
+
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, false);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, dirStart)) {
 
 			// Subdirectory section
 			string subDirName = m[1];
+			if (!std::string(m[3]).empty() && !std::string(m[4]).empty() && !std::string(m[5]).empty() && !std::string(m[6]).empty()) {
+				nodeGID = std::stoi(m[3]);
+				nodeUID = std::stoi(m[4]);
+				nodeATR = std::stoi(m[5]);
+				nodeATRP = std::stoi(m[6]);
+				nodeDate = m[7];
+				dirDateParent = m[8];
+				nodeTimezone = std::stoi(m[9]);
+				nodeTimezoneParent = std::stoi(m[10]);
+				nodeHidden = std::stoi(m[11]);
+			}
 			checkDString(subDirName, "directory name");
 
 			uint32_t startSector = checkLBN(m[2], subDirName);
 
-			DirNode * subDir = parseDir(catalogFile, cat, subDirName, path / subDirName, dir, startSector);
+			DirNode * subDir = parseDir(catalogFile, cat, subDirName, path / subDirName, dir, startSector, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, dirDateParent, nodeTimezone, nodeTimezoneParent, nodeHidden);
 			dir->children.push_back(subDir);
 
 		} else {
@@ -619,7 +800,8 @@ static void parseCatalog(ifstream & catalogFile, Catalog & cat, const fs::path &
 
 		static const regex systemAreaStart("system_area\\s*\\{");
 		static const regex volumeStart("volume\\s*\\{");
-		static const regex rootDirStart("dir\\s*\\{");
+		static const regex rootDirStart("dir\\s*(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATRS(\\d+))?(?:\\s*ATRP(\\d+))?(?:\\s*DATES(\\d*))?(?:\\s*DATEP(\\d*))?(?:\\s*TIMEZONES(\\d+))?(?:\\s*TIMEZONEP(\\d+))?(?:\\s*HIDDEN(\\d+))?\\s*\\{");
+		smatch m;
 
 		if (regex_match(line, systemAreaStart)) {
 
@@ -631,13 +813,20 @@ static void parseCatalog(ifstream & catalogFile, Catalog & cat, const fs::path &
 			// Parse volume section
 			parseVolume(catalogFile, cat);
 
-		} else if (regex_match(line, rootDirStart)) {
-
+		} else if (regex_match(line, m, rootDirStart)) {
+				uint16_t nodeGID = std::stoi(m[2]);
+				uint16_t nodeUID = std::stoi(m[3]);
+				uint16_t nodeATR = std::stoi(m[4]);
+				uint16_t nodeATRP = std::stoi(m[5]);
+				string nodeDate = m[6];
+				string dirDateParent = m[7];
+				int16_t nodeTimezone = std::stoi(m[8]);
+				int16_t nodeTimezoneParent = std::stoi(m[8]);
 			// Parse root directory entry
 			if (cat.root) {
 				throw runtime_error("More than one root directory section in catalog file");
 			} else {
-				cat.root = parseDir(catalogFile, cat, "", fsBase);
+				cat.root = parseDir(catalogFile, cat, "", fsBase, NULL, 0, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, dirDateParent, nodeTimezone, nodeTimezoneParent);
 			}
 
 		} else {
@@ -704,7 +893,7 @@ public:
 	void visitNode(FSNode & node)
 	{
 		// Minimum start sector requested?
-		if (node.requestedStartSector) {
+		if (node.requestedStartSector && !isDA(node.name)) { // Ignore for CDDA but keep the value instead of setting it to 0. Its neeed for the MakeDirectories function.
 
 			// Yes, before current sector?
 			if (node.requestedStartSector < currentSector) {
@@ -748,42 +937,61 @@ public:
 
 		// Create the directory extent
 		iso9660_xa_t xaAttr;
-		iso9660_xa_init(&xaAttr, 0, 0, XA_FORM1_DIR, 0);
+		iso9660_xa_t xaAttrP;
+		iso9660_xa_init(&xaAttr, 0, 0, dir.nodeATR, 0);
+		iso9660_xa_init(&xaAttrP, 0, 0, dir.nodeATRP, 0);
 
 		uint32_t parentSector = dir.parent ? dir.parent->firstSector : dir.firstSector;
 		uint32_t parentSize = (dir.parent ? dir.parent->numSectors : dir.numSectors) * ISO_BLOCKSIZE;
 
-		struct tm dirTm;
-		iso9660_get_ltime(&cat.creationDate, &dirTm);
-		time_t dirTime = mktime(&dirTm);
+		time_t dirTime;
+		time_t dirTimeParent;
+		convertToEpochTime(dir.nodeDate, dirTime);
+		convertToEpochTime(dir.dirDateParent, dirTimeParent);
 
 		uint8_t * data = new uint8_t[dirSize];
 		iso9660_dir_init_new_su(data,
 		                        dir.firstSector, dirSize, &xaAttr, sizeof(xaAttr),
-		                        parentSector, parentSize, &xaAttr, sizeof(xaAttr),
-		                        &dirTime);
+		                        parentSector, parentSize, &xaAttrP, sizeof(xaAttrP),
+		                        &dirTime, &dirTimeParent, (dir.nodeTimezone * 15), (dir.nodeTimezoneParent * 15));
 
 		// Add the records for all children
 		for (vector<FSNode *>::const_iterator i = dir.sortedChildren.begin(); i != dir.sortedChildren.end(); ++i) {
 			FSNode * node = *i;
 			uint32_t size = node->numSectors * ISO_BLOCKSIZE;
-			uint8_t flags = ISO_FILE | ISO_EXISTENCE;
+			uint8_t flags;
+			string nodeDate = "";
+			int16_t nodeTimezone = 0;
 
 			if (FileNode * file = dynamic_cast<FileNode *>(node)) {
+				flags = (file->nodeHidden) ? ISO_FILE | ISO_EXISTENCE : ISO_FILE;
+				nodeDate = file->nodeDate;
+				nodeTimezone = file->nodeTimezone;
 				if (file->isForm2) {
-					iso9660_xa_init(&xaAttr, cat.defaultUID, cat.defaultGID, XA_FORM2_FILE, 1);
+					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 1); // form2_file = 1555 hex or 5461 dec. form1_file = 0d55 hex or 3413 dec. Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec
+					if (isDA(node->name)) { // These are not processed normally. Recalculate size and startsector
+						iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 0); // form1_file = 0d55 hex or 3413 dec. Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec
+						size = file->nodeSize;
+						node->firstSector = node->requestedStartSector + track1SectorCountOffset; // Add the offset between the original and the new rebuild sector count to fix the CDDA entries.
+					}
 				} else {
-					iso9660_xa_init(&xaAttr, cat.defaultUID, cat.defaultGID, XA_FORM1_FILE, 0);
+					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 0); // Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec. UID = 0014 hex or 20 dec GID = 045d hex or 1117 dec.
 					size = file->size;
 				}
 			} else if (DirNode * dir = dynamic_cast<DirNode *>(node)) {
-				iso9660_xa_init(&xaAttr, 0, 0, XA_FORM1_DIR, 0);
-				flags = ISO_DIRECTORY | ISO_EXISTENCE;
+				iso9660_xa_init(&xaAttr, dir->nodeUID, dir->nodeGID, dir->nodeATR, 0); // form1_dir = 8d55 hex or 36181 dec   
+				nodeDate = dir->nodeDate;
+				nodeTimezone = dir->nodeTimezone;
+				flags = (dir->nodeHidden) ? ISO_DIRECTORY | ISO_EXISTENCE : ISO_DIRECTORY;
 			} else {
 				throw runtime_error("Internal filesystem tree corrupt");
 			}
 
-			iso9660_dir_add_entry_su(data, node->name.c_str(), node->firstSector, size, flags, &xaAttr, sizeof(xaAttr), &dirTime);
+			time_t nodeTime;
+ 			convertToEpochTime(nodeDate, nodeTime);
+
+ 			iso9660_dir_add_entry_su(data, node->name.c_str(), node->firstSector, size, flags, &xaAttr, sizeof(xaAttr), &nodeTime, (nodeTimezone * 15));
+ 			
 		}
 
 		dir.data = data;
@@ -830,12 +1038,14 @@ public:
 
 	void visit(FileNode & file)
 	{
+		if (file.isForm2 && isDA(file.name)) { return; } // disable further processing of CDDA
+
 		ifstream f(file.path, ifstream::in | ifstream::binary);
 		if (!f) {
 			throw runtime_error(format("Cannot open file {}", file.path.string()));
 		}
 
-		cdio_info("Writing \"%s\"...", file.path.c_str());
+		cdio_info("Writing \"%ls\"...", file.path.c_str());
 
 		writeGap(file.firstSector);
 
@@ -853,6 +1063,14 @@ public:
 
 			if (file.isForm2) {
 				_vcd_make_mode2(buffer, data + CDIO_CD_SUBHEADER_SIZE, currentSector, data[0], data[1], data[2], data[3]);
+				if (file.nodeEDC == true) { // If the Mode 2 Form 2 files need to be stripped of their EDC checksum (Like Audio/Video/.STR/.XXA)
+					if ((buffer[18] & 0x20) == 0x20) {
+						buffer[2348] = '\0';
+						buffer[2349] = '\0';
+						buffer[2350] = '\0';
+						buffer[2351] = '\0';
+					}
+				}
 			} else {
 				_vcd_make_mode2(buffer, data, currentSector, 0, 0, subMode, 0);
 			}
@@ -899,10 +1117,10 @@ private:
 
 // Write the system area to the image file, optionally using the file
 // specified in the catalog as input.
-static void writeSystemArea(ofstream & image, const Catalog & cat)
+static void writeSystemArea(ofstream & image, const Catalog &cat)
 {
 	const size_t numSystemSectors = 16;
-	const size_t systemAreaSize = numSystemSectors * CDIO_CD_FRAMESIZE;
+	const size_t systemAreaSize = numSystemSectors * CDIO_CD_FRAMESIZE_RAW;
 
 	unique_ptr<char[]> data(new char[systemAreaSize]);
 	memset(data.get(), 0, systemAreaSize);
@@ -923,20 +1141,22 @@ static void writeSystemArea(ofstream & image, const Catalog & cat)
 		}
 	}
 
-	size_t numFileSectors = (fileSize + CDIO_CD_FRAMESIZE - 1) / CDIO_CD_FRAMESIZE;
+	size_t numFileSectors = (fileSize + CDIO_CD_FRAMESIZE_RAW - 1) / CDIO_CD_FRAMESIZE_RAW;
 
 	// Write system area to image file
 	for (size_t sector = 0; sector < numFileSectors; ++sector) {
 
 		// Data sectors
-		_vcd_make_mode2(buffer, data.get() + sector * CDIO_CD_FRAMESIZE, sector, 0, 0, SM_DATA, 0);
+		char buffer[CDIO_CD_FRAMESIZE_RAW];
+		memcpy(buffer, data.get() + sector * CDIO_CD_FRAMESIZE_RAW, CDIO_CD_FRAMESIZE_RAW);
 		image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 	}
 
 	for (size_t sector = numFileSectors; sector < numSystemSectors; ++sector) {
 
 		// Empty sectors
-		_vcd_make_mode2(buffer, emptySector, sector, 0, 0, SM_FORM2, 0);
+		char buffer[CDIO_CD_FRAMESIZE_RAW];
+		memset(buffer, 0, CDIO_CD_FRAMESIZE_RAW);
 		image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 	}
 }
@@ -946,7 +1166,7 @@ static void writeSystemArea(ofstream & image, const Catalog & cat)
 static void usage(const char * progname, int exitcode = 0, const string & error = "")
 {
 	cout << "Usage: " << fs::path(progname).filename().string() << " [OPTION...] <input>[.cat] [<output>[.bin]]" << endl;
-    cout << "  -c, --cuefile                   Create a .cue file" << endl;
+	cout << "  -c, --cuefile                   Create a .cue file" << endl;
 	cout << "  -v, --verbose                   Be verbose" << endl;
 	cout << "  -V, --version                   Display version information and exit" << endl;
 	cout << "  -?, --help                      Show this help message" << endl;
@@ -1048,6 +1268,22 @@ int main(int argc, char ** argv)
 		cat.root->traverse(alloc);  // must use the same traversal order as "WriteData" below
 
 		uint32_t volumeSize = alloc.getCurrentSector();
+		
+		// Add postgap sectors to the volumeSize
+		if (track1PostgapSectors && track1PostgapSectors > 70) {
+			volumeSize = volumeSize + track1PostgapSectors;
+		}
+		
+		// Add offset calculation from track1SectorCount and actual volumeSize for CDDA audio entries. Add the postgap for the correct start adress!
+		if (track1SectorCount > 150) {
+			track1SectorCountOffset = volumeSize - track1SectorCount;
+		}
+
+		// if CDDA add (filesize / 2352) to the volumeSize
+		if (audioSectors > 0) {
+			volumeSize = volumeSize + audioSectors;
+		}
+		
 		if (volumeSize > MAX_ISO_SECTORS) {
 			cerr << "Warning: Output image larger than "
 			     << (MAX_ISO_SECTORS * CDIO_CD_FRAMESIZE_RAW / (1024*1024)) << " MiB\n";
@@ -1088,8 +1324,10 @@ int main(int argc, char ** argv)
 		iso9660_pvd_t volumeDesc;
 
 		struct tm rootTm;
+		time_t rootTime;
 		iso9660_get_ltime(&cat.creationDate, &rootTm);
-		time_t rootTime = mktime(&rootTm);
+		rootTime = timegm(&rootTm) - (timeZone * (15 * 60));
+		gmtime_s(&rootTm, &rootTime);
 
 		iso9660_dir_t rootDirRecord;
 		memset(&rootDirRecord, 0, sizeof(rootDirRecord));
@@ -1097,7 +1335,7 @@ int main(int argc, char ** argv)
 		rootDirRecord.length = to_711(iso9660_dir_calc_record_size(0, 0));
 		rootDirRecord.extent = to_733(rootDirStartSector);
 		rootDirRecord.size = to_733(cat.root->numSectors * ISO_BLOCKSIZE);
-		iso9660_set_dtime(&rootTm, &rootDirRecord.recording_time);
+		iso9660_set_dtime_with_timezone(&rootTm, (timeZone * 15), &rootDirRecord.recording_time);
 		rootDirRecord.file_flags = ISO_DIRECTORY;
 		rootDirRecord.volume_sequence_number = to_723(1);
 		rootDirRecord.filename.len = 1;
@@ -1149,6 +1387,31 @@ int main(int argc, char ** argv)
 		WriteData writeData(image, rootDirStartSector);
 		cat.root->traverse(writeData);  // must use the same traversal order as "AllocSectors" above
 
+		// Write postgap. Usually 150 blank sectors which is standard.
+		if (track1PostgapSectors && track1PostgapSectors > 70) {
+			char buffer[CDIO_CD_FRAMESIZE_RAW];
+			char payload[CDIO_CD_FRAMESIZE_RAW];
+			memset(payload, 0, CDIO_CD_FRAMESIZE_RAW);
+			for (int i = 0; i < track1PostgapSectors; i++) {
+				if (track1PostgapType == 1) {
+					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0); // Type 1 is empty
+				} else if (track1PostgapType == 2){
+					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, SM_FORM2, 0); // Type 2 has Mode2 bytes set.
+				} else if (track1PostgapType == 3){
+					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, SM_FORM2, 0); // Type 3 has Mode2 bytes set and EDC.
+				} else {
+					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0); // Empty for now, need to write raw dumper.
+				}
+				if (buffer[18] == 0x20 && track1PostgapType != 3) { // Zero out the last 4 EDC bytes for type 2.
+					buffer[2348] = '\0';
+					buffer[2349] = '\0';
+					buffer[2350] = '\0';
+					buffer[2351] = '\0';
+				}
+				image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
+			}
+		}
+
 		// Close the image file
 		if (!image) {
 			throw runtime_error(format("Error writing to image file {}", imageName.string()));
@@ -1167,10 +1430,26 @@ int main(int argc, char ** argv)
 				throw runtime_error(format("Error creating cue file {}", cueName.string()));
 			}
 
-			cueFile << "FILE " << imageName << " BINARY\r\n";
-			cueFile << "  TRACK 01 MODE2/2352\r\n";
-			cueFile << "    INDEX 01 00:00:00\r\n";
+			bool validData = (original_cue_file.find("FILE") != std::string::npos) &&
+			                 (original_cue_file.find("TRACK") != std::string::npos) &&
+			                 (original_cue_file.find("INDEX") != std::string::npos) &&
+			                 (original_cue_file.find("BINARY") != std::string::npos);
 
+			if (!validData) {
+				cueFile << "FILE " << imageName << " BINARY\r\n";
+				cueFile << "  TRACK 01 MODE2/2352\r\n";
+				cueFile << "    INDEX 01 00:00:00\r\n";
+			} else {
+				size_t filePos = original_cue_file.find("FILE");
+				size_t startPos = original_cue_file.find("\"", filePos) + 1;
+				size_t endPos = original_cue_file.find("\"", startPos);
+
+				if (filePos != std::string::npos && startPos != std::string::npos && endPos != std::string::npos) {
+					original_cue_file.replace(startPos, endPos - startPos, imageName.string());
+				}
+
+				cueFile << original_cue_file;
+			}
 			if (!cueFile) {
 				throw runtime_error(format("Error writing to cue file {}", cueName.string()));
 			}

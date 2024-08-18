@@ -37,12 +37,13 @@ extern "C" {
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 namespace fs = std::filesystem;
 using namespace std;
 
 
-#define TOOL_VERSION "PSXInject 2.2"
+#define TOOL_VERSION "PSXInject v2.2.1 (Win32 by ^Ripper)"
 
 
 // Print usage information and exit.
