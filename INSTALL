@@ -34,7 +34,7 @@ You can build PSXImager for Windows using the MSYS2 environment.
   3. Open "mingw32.exe" in MSYS2 root folder.
   4. Update, install compiler and necessary packages:
 
-     pacman -Suy
+     pacman -Suy --noconfirm
 
      pacman -S --noconfirm autoconf automake make
      pacman -S --noconfirm mingw-w64-i686-toolchain \
@@ -45,7 +45,7 @@ You can build PSXImager for Windows using the MSYS2 environment.
      mkdir psximager
      cd psximager
      
-  6. Download the psximager-v2.2.1 github repository.
+  6. Download the psximager-v2.2.1 github release.
 
      wget https://github.com/Ripper55555/psximager/archive/refs/tags/psximager-v2.2.1.tar.gz
      tar -xf psximager-v2.2.1.tar.gz
