@@ -1,3 +1,57 @@
+PSXImager V2.2.1 (^Ripper)
+
+Important!
+This patch has been made for a specific game i'm working on, but can
+also be used for other projects.
+
+Changes have been made in how the directory is being rebuilt.
+The catalog file has now been extended to include all relevant information.
+This means that you can make a 1:1 perfect rebuild of the ripped ISO.
+
+There are a few caveats though.
+If the original ISO has been build with the Y2K bug then as of now it can't
+put the defective date stamp back.
+Also other bugs/random data can prevent a full 1:1 rebuild.
+But a good file compare program can show you how well it works.
+
+Libcdio has been patched to fix issues or missing functions.
+Some of the fixes include:
+
+- The 16 sector system area now gets dumped raw.
+  EDC errors and all because they are there by design.
+- Fix the hidden flag always stuck on 1 (hidden)
+- All dates preserved instead of defaulting pvd.creation_time for all.
+- Catalog file now includes the following for each file / directory entry
+  - GID
+  - UID
+  - ATRibutes
+  - DATE (File)
+  - DATES / DATEP (Directory self/parent entry . and ..)
+  - TIMEZONE (File)
+  - TIMEZONES / TIMEZONEP (Directory self/parent entry . and ..)
+  - SIZE (File)
+  - HIDDEN
+  - ZEROEDC (automatic detection if xafile has zero'd out EDC checksum)
+  - Full copy of the .CUE file in base64 when ripped.
+    For use in rebuilding a new .CUE file.
+  - Rebuild the postgap of the data track that is missing.
+    Data track 1 sector count, postgap sector count and postgap type.
+    Postgap type can detect 3 common types or defaults to all zero's.
+- Audio track locations are now compensated.
+  The sector start address should change when the ISO grows / shrinks.
+  Nothing changes for tracks 2+ and are re-used in the recreation
+  of the .cue file if -c is used.
+  So you can have the original and rebuild ISO share tracks 2+.
+
+The Y2K bug is when the year 2000 is stored as 00 hex instead of 64.
+tm Struct years start counting from 1900 so it should be 64 (100 dec)
+Time functions use a 32bit signed integer and going negative to epoch
+(1970) goes only back to 1901...
+
+^Ripper
+
+---------------------------------------------------------------------------
+
 PSXImager V2.2
 ==============
 
