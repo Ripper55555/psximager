@@ -536,6 +536,7 @@ struct iso9660_stat_s { /* big endian!! */
   lsn_t              lsn;             /**< start logical sector number */
   uint32_t           size;            /**< total size in bytes */
   uint32_t           secsize;         /**< number of sectors allocated */
+  bool               y2kbug;          /**< year is less then 1970 */
   int16_t            timezone;        /**< timezone */
   iso9660_xa_t       xa;              /**< XA attributes */
   enum { _STAT_HIDDEN = 1, _STAT_VISIBLE = 0 } hidden;
@@ -718,7 +719,8 @@ typedef struct _iso9660_s iso9660_t;
   */
   void iso9660_set_dtime_with_timezone (const struct tm *p_tm,
                                         int timezone,
-                                        /*out*/ iso9660_dtime_t *p_idr_date);
+                                        /*out*/ iso9660_dtime_t *p_idr_date,
+                                        int y2kbug);
 
   /*!
     Set "long" time in format used in ISO 9660 primary volume descriptor
@@ -862,7 +864,8 @@ iso9660_dir_init_new (void *dir, uint32_t self, uint32_t ssize,
                       const time_t *dir_timeS,
                       const time_t *dir_timeP,
                       int timezoneS,
-                      int timezoneP);
+                      int timezoneP,
+                      int y2kbug);
 
 void
 iso9660_dir_init_new_su (void *dir, uint32_t self, uint32_t ssize,
@@ -872,13 +875,14 @@ iso9660_dir_init_new_su (void *dir, uint32_t self, uint32_t ssize,
                          const time_t *dir_timeS,
                          const time_t *dir_timeP,
                          int timezoneS,
-                         int timezoneP);
+                         int timezoneP,
+                         int y2kbug);
 
 void
 iso9660_dir_add_entry_su (void *dir, const char filename[], uint32_t extent,
                           uint32_t size, uint8_t file_flags,
                           const void *su_data,
-                          unsigned int su_size, const time_t *entry_time, int timezone);
+                          unsigned int su_size, const time_t *entry_time, int timezone, int y2kbug);
 
 unsigned int
 iso9660_dir_calc_record_size (unsigned int namelen, unsigned int su_len);
@@ -1255,7 +1259,8 @@ lsn_t iso9660_get_dir_extent(const iso9660_dir_t *p_idr);
                         uint32_t iso_size, const void *root_dir,
                         uint32_t path_table_l_extent,
                         uint32_t path_table_m_extent,
-                        uint32_t path_table_size, const time_t *pvd_time);
+                        uint32_t path_table_size, const time_t *pvd_time,
+                        int y2kbug);
 
   void iso9660_set_evd (void *pd);
 

@@ -798,6 +798,7 @@ _iso9660_dir_to_statbuf (iso9660_dir_t *p_iso9660_dir, bool_3way_t b_xa,
     cdio_warn("Couldn't calloc(1, %d)", stat_len);
     return NULL;
     }
+  p_stat->y2kbug  = (p_iso9660_dir->recording_time.dt_year < 70);
   p_stat->timezone= (int16_t)p_iso9660_dir->recording_time.dt_gmtoff;
   p_stat->hidden  = (p_iso9660_dir->file_flags & ISO_EXISTENCE)
    ? _STAT_HIDDEN : _STAT_VISIBLE;

@@ -48,7 +48,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXBuild v2.2.1 (Win32 by ^Ripper)"
+#define TOOL_VERSION "PSXBuild v2.2.2 (Win32 by ^Ripper)"
 #ifdef _WIN32
     #define timegm _mkgmtime
 #endif
@@ -62,6 +62,7 @@ int track1SectorCountOffset = 0;
 int track1PostgapSectors = 0;
 int track1PostgapType = 0;
 int timeZone = 0;
+int y2kbug = 0;
 std::string original_cue_file = "";
 
 // Mode 2 raw sector buffer
@@ -100,7 +101,7 @@ std::string base64_decode(const std::string& encodedContent) {
 
 
 // Check for .DA audio tracks.
-bool isDA(const std::string& str) {
+bool isDA(const std::string & str) {
 	return str.find(".DA;1") != std::string::npos;
 }
 
@@ -227,8 +228,8 @@ struct CmpByName {
 
 // File (leaf) node
 struct FileNode : public FSNode {
-	FileNode(const string & name_, const fs::path & path_, DirNode * parent_, uint32_t startSector_ = 0, bool isForm2_ = false, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, string nodeDate_ = "", int16_t nodeTimezone_ = 0, uint32_t nodeSize_ = 0, bool nodeHidden_ = false, bool nodeEDC_ = false)
-		: FSNode(name_, path_, parent_, startSector_), isForm2(isForm2_), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeDate(nodeDate_), nodeTimezone(nodeTimezone_), nodeSize(nodeSize_), nodeHidden(nodeHidden_), nodeEDC(nodeEDC_)
+	FileNode(const string & name_, const fs::path & path_, DirNode * parent_, uint32_t startSector_ = 0, bool isForm2_ = false, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, string nodeDate_ = "", int16_t nodeTimezone_ = 0, uint32_t nodeSize_ = 0, bool nodeHidden_ = false, int nodeY2kbug_ = 0, bool nodeEDC_ = false)
+		: FSNode(name_, path_, parent_, startSector_), isForm2(isForm2_), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeDate(nodeDate_), nodeTimezone(nodeTimezone_), nodeSize(nodeSize_), nodeHidden(nodeHidden_), nodeY2kbug(nodeY2kbug_), nodeEDC(nodeEDC_)
 	{
 		// Check for the existence of the file and obtain its size
 		size = fs::file_size(path);
@@ -247,10 +248,11 @@ struct FileNode : public FSNode {
 	uint16_t nodeUID;
 	uint16_t nodeATR;
 	string nodeDate;
-	string dirDateParent;
+	string nodeDateParent;
 	int16_t nodeTimezone;
 	uint32_t nodeSize;
 	bool nodeHidden;
+	int nodeY2kbug;
 	bool nodeEDC;
 
 	// Size in bytes
@@ -265,8 +267,8 @@ struct FileNode : public FSNode {
 
 // Directory node
 struct DirNode : public FSNode {
-	DirNode(const string & name_, const fs::path & path_, DirNode * parent_ = NULL, uint32_t startSector_ = 0, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, uint16_t nodeATRP_ = 0, string nodeDate_ = "", string dirDateParent_ = "", int16_t nodeTimezone_ = 0, int16_t nodeTimezoneParent_ = 0, bool nodeHidden_ = false)
-		: FSNode(name_, path_, parent_, startSector_), data(NULL), recordNumber(0), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeATRP(nodeATRP_), nodeDate(nodeDate_), dirDateParent(dirDateParent_), nodeTimezone(nodeTimezone_), nodeTimezoneParent(nodeTimezoneParent_), nodeHidden(nodeHidden_) { }
+	DirNode(const string & name_, const fs::path & path_, DirNode * parent_ = NULL, uint32_t startSector_ = 0, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, uint16_t nodeATRP_ = 0, string nodeDate_ = "", string nodeDateParent_ = "", int16_t nodeTimezone_ = 0, int16_t nodeTimezoneParent_ = 0, bool nodeHidden_ = false, int nodeY2kbug_ = 0)
+		: FSNode(name_, path_, parent_, startSector_), data(NULL), recordNumber(0), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeATRP(nodeATRP_), nodeDate(nodeDate_), nodeDateParent(nodeDateParent_), nodeTimezone(nodeTimezone_), nodeTimezoneParent(nodeTimezoneParent_), nodeHidden(nodeHidden_), nodeY2kbug(nodeY2kbug_) { }
 
 	// The list
 	uint16_t nodeGID;
@@ -274,10 +276,11 @@ struct DirNode : public FSNode {
 	uint16_t nodeATR;
 	uint16_t nodeATRP;
 	string nodeDate;
-	string dirDateParent;
+	string nodeDateParent;
 	int16_t nodeTimezone;
 	int16_t nodeTimezoneParent;
 	bool nodeHidden;
+	int nodeY2kbug;
 
 	// Pointer to directory extent data
 	uint8_t * data;
@@ -428,8 +431,8 @@ static void checkFileName(const string & s, const string & description)
 
 static void convertToEpochTime(const std::string& date, time_t& epoch_time) {
 	std::string new_date = date;
-	if (new_date.substr(0, 2) == "00") { // the Y2K / 00 hex for year issue on some ISO's.
-	  if (std::stoi(new_date.substr(2, 2)) > 90) {
+	if (new_date.substr(0, 2) == "00" || new_date.substr(0, 2) == "19") { // The Y2K problem where years are encoded 00 for year 2000 instead of 64 hex.
+	  if (std::stoi(new_date.substr(2, 2)) >= 70) {
 			new_date.replace(0, 2, "19");
 		} else {
 			new_date.replace(0, 2, "20");
@@ -657,9 +660,9 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 
 
 // Recursively parse a "dir" section of the catalog file.
-static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & dirName, const fs::path & path, DirNode * parent = NULL, uint32_t startSector = 0, uint16_t nodeGID = 0, uint16_t nodeUID = 0, uint16_t nodeATR = 0, uint16_t nodeATRP = 0, string nodeDate = "", string dirDateParent = "", int16_t nodeTimezone = 0, int16_t nodeTimezoneParent = 0, bool nodeHidden = false)
+static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & dirName, const fs::path & path, DirNode * parent = NULL, uint32_t startSector = 0, uint16_t nodeGID = 0, uint16_t nodeUID = 0, uint16_t nodeATR = 0, uint16_t nodeATRP = 0, string nodeDate = "", string nodeDateParent = "", int16_t nodeTimezone = 0, int16_t nodeTimezoneParent = 0, bool nodeHidden = false, int nodeY2kbug = 0)
 {
-	DirNode * dir = new DirNode(dirName, path, parent, startSector, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, dirDateParent, nodeTimezone, nodeTimezoneParent, nodeHidden);
+	DirNode * dir = new DirNode(dirName, path, parent, startSector, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, nodeDateParent, nodeTimezone, nodeTimezoneParent, nodeHidden, nodeY2kbug);
 
 	while (true) {
 		// Reset everything on each itteration.
@@ -668,11 +671,12 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 		nodeATR = 0;
 		nodeATRP = 0;
 		nodeDate = "";
-		dirDateParent = "";
+		nodeDateParent = "";
 		nodeTimezone = 0;
 		nodeTimezoneParent = 0;
 		uint32_t nodeSize = 0;
 		nodeHidden = false;
+		nodeY2kbug = 0;
 		bool nodeEDC = false;
 
 		string line = nextline(catalogFile);
@@ -680,10 +684,10 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 			throw runtime_error(format("Syntax error in catalog file: unterminated directory section \"{}\"", dirName));
 		}
 
-		static const regex fileSpec        ("file\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?");
-		static const regex xaFileSpec    ("xafile\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*ZEROEDC(\\d+))?");
-		static const regex cddaFileSpec("cddafile\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?");
-		static const regex dirStart         ("dir\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATRS(\\d+))?(?:\\s*ATRP(\\d+))?(?:\\s*DATES(\\d*))?(?:\\s*DATEP(\\d*))?(?:\\s*TIMEZONES(\\d+))?(?:\\s*TIMEZONEP(\\d+))?(?:\\s*HIDDEN(\\d+))?\\s*\\{");
+		static const regex fileSpec        ("file\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*Y2KBUG(\\d+))?");
+		static const regex xaFileSpec    ("xafile\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*Y2KBUG(\\d+))?(?:\\s*ZEROEDC(\\d+))?");
+		static const regex cddaFileSpec("cddafile\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATR(\\d+))?(?:\\s*DATE(\\d+))?(?:\\s*TIMEZONE(\\d+))?(?:\\s*SIZE(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*Y2KBUG(\\d+))?");
+		static const regex dirStart         ("dir\\s*(\\S+)(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATRS(\\d+))?(?:\\s*ATRP(\\d+))?(?:\\s*DATES(\\d*))?(?:\\s*DATEP(\\d*))?(?:\\s*TIMEZONES(\\d+))?(?:\\s*TIMEZONEP(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*Y2KBUG(\\d+))?\\s*\\{");
 		smatch m;
 
 		if (line == "}") {
@@ -703,12 +707,13 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 				nodeTimezone = std::stoi(m[7]);
 				nodeSize = std::stoi(m[8]);
 				nodeHidden = std::stoi(m[9]);
+				nodeY2kbug = std::stoi(m[10]);
 			}
 			checkFileName(fileName, "file name");
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, false, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, false);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, false, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeY2kbug, false);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, xaFileSpec)) {
@@ -723,13 +728,14 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 				nodeTimezone = std::stoi(m[7]);
 				nodeSize = std::stoi(m[8]);
 				nodeHidden = std::stoi(m[9]);
-				nodeEDC = std::stoi(m[10]);
+				nodeY2kbug = std::stoi(m[10]);
+				nodeEDC = std::stoi(m[11]);
 			}
 			checkFileName(fileName, "file name");
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeEDC);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeY2kbug, nodeEDC);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, cddaFileSpec)) {
@@ -744,12 +750,13 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 				nodeTimezone = std::stoi(m[7]);
 				nodeSize = std::stoi(m[8]);
 				nodeHidden = std::stoi(m[9]);
+				nodeY2kbug = std::stoi(m[10]);
 			}
 			checkFileName(fileName, "file name");
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, false);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeY2kbug, false);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, dirStart)) {
@@ -762,16 +769,17 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 				nodeATR = std::stoi(m[5]);
 				nodeATRP = std::stoi(m[6]);
 				nodeDate = m[7];
-				dirDateParent = m[8];
+				nodeDateParent = m[8];
 				nodeTimezone = std::stoi(m[9]);
 				nodeTimezoneParent = std::stoi(m[10]);
 				nodeHidden = std::stoi(m[11]);
+				nodeY2kbug = std::stoi(m[12]);
 			}
 			checkDString(subDirName, "directory name");
 
 			uint32_t startSector = checkLBN(m[2], subDirName);
 
-			DirNode * subDir = parseDir(catalogFile, cat, subDirName, path / subDirName, dir, startSector, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, dirDateParent, nodeTimezone, nodeTimezoneParent, nodeHidden);
+			DirNode * subDir = parseDir(catalogFile, cat, subDirName, path / subDirName, dir, startSector, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, nodeDateParent, nodeTimezone, nodeTimezoneParent, nodeHidden, nodeY2kbug);
 			dir->children.push_back(subDir);
 
 		} else {
@@ -800,7 +808,7 @@ static void parseCatalog(ifstream & catalogFile, Catalog & cat, const fs::path &
 
 		static const regex systemAreaStart("system_area\\s*\\{");
 		static const regex volumeStart("volume\\s*\\{");
-		static const regex rootDirStart("dir\\s*(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATRS(\\d+))?(?:\\s*ATRP(\\d+))?(?:\\s*DATES(\\d*))?(?:\\s*DATEP(\\d*))?(?:\\s*TIMEZONES(\\d+))?(?:\\s*TIMEZONEP(\\d+))?(?:\\s*HIDDEN(\\d+))?\\s*\\{");
+		static const regex rootDirStart("dir\\s*(?:\\s*@(\\d+))?(?:\\s*GID(\\d+))?(?:\\s*UID(\\d+))?(?:\\s*ATRS(\\d+))?(?:\\s*ATRP(\\d+))?(?:\\s*DATES(\\d*))?(?:\\s*DATEP(\\d*))?(?:\\s*TIMEZONES(\\d+))?(?:\\s*TIMEZONEP(\\d+))?(?:\\s*HIDDEN(\\d+))?(?:\\s*Y2KBUG(\\d+))?\\s*\\{");
 		smatch m;
 
 		if (regex_match(line, systemAreaStart)) {
@@ -819,14 +827,18 @@ static void parseCatalog(ifstream & catalogFile, Catalog & cat, const fs::path &
 				uint16_t nodeATR = std::stoi(m[4]);
 				uint16_t nodeATRP = std::stoi(m[5]);
 				string nodeDate = m[6];
-				string dirDateParent = m[7];
+				string nodeDateParent = m[7];
 				int16_t nodeTimezone = std::stoi(m[8]);
-				int16_t nodeTimezoneParent = std::stoi(m[8]);
+				int16_t nodeTimezoneParent = std::stoi(m[9]);
+				int nodeY2kbug = std::stoi(m[11]);
+				if (nodeY2kbug == 1 || nodeY2kbug == 11) {
+					y2kbug = 1;
+				}
 			// Parse root directory entry
 			if (cat.root) {
 				throw runtime_error("More than one root directory section in catalog file");
 			} else {
-				cat.root = parseDir(catalogFile, cat, "", fsBase, NULL, 0, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, dirDateParent, nodeTimezone, nodeTimezoneParent);
+				cat.root = parseDir(catalogFile, cat, "", fsBase, NULL, 0, nodeGID, nodeUID, nodeATR, nodeATRP, nodeDate, nodeDateParent, nodeTimezone, nodeTimezoneParent, 0, nodeY2kbug);
 			}
 
 		} else {
@@ -947,13 +959,13 @@ public:
 		time_t dirTime;
 		time_t dirTimeParent;
 		convertToEpochTime(dir.nodeDate, dirTime);
-		convertToEpochTime(dir.dirDateParent, dirTimeParent);
+		convertToEpochTime(dir.nodeDateParent, dirTimeParent);
 
 		uint8_t * data = new uint8_t[dirSize];
 		iso9660_dir_init_new_su(data,
 		                        dir.firstSector, dirSize, &xaAttr, sizeof(xaAttr),
 		                        parentSector, parentSize, &xaAttrP, sizeof(xaAttrP),
-		                        &dirTime, &dirTimeParent, (dir.nodeTimezone * 15), (dir.nodeTimezoneParent * 15));
+		                        &dirTime, &dirTimeParent, (dir.nodeTimezone * 15), (dir.nodeTimezoneParent * 15), dir.nodeY2kbug);
 
 		// Add the records for all children
 		for (vector<FSNode *>::const_iterator i = dir.sortedChildren.begin(); i != dir.sortedChildren.end(); ++i) {
@@ -962,11 +974,13 @@ public:
 			uint8_t flags;
 			string nodeDate = "";
 			int16_t nodeTimezone = 0;
+			int nodeY2kbug = 0;
 
 			if (FileNode * file = dynamic_cast<FileNode *>(node)) {
 				flags = (file->nodeHidden) ? ISO_FILE | ISO_EXISTENCE : ISO_FILE;
 				nodeDate = file->nodeDate;
 				nodeTimezone = file->nodeTimezone;
+				nodeY2kbug = file->nodeY2kbug;
 				if (file->isForm2) {
 					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 1); // form2_file = 1555 hex or 5461 dec. form1_file = 0d55 hex or 3413 dec. Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec
 					if (isDA(node->name)) { // These are not processed normally. Recalculate size and startsector
@@ -982,6 +996,7 @@ public:
 				iso9660_xa_init(&xaAttr, dir->nodeUID, dir->nodeGID, dir->nodeATR, 0); // form1_dir = 8d55 hex or 36181 dec   
 				nodeDate = dir->nodeDate;
 				nodeTimezone = dir->nodeTimezone;
+				nodeY2kbug = dir->nodeY2kbug;
 				flags = (dir->nodeHidden) ? ISO_DIRECTORY | ISO_EXISTENCE : ISO_DIRECTORY;
 			} else {
 				throw runtime_error("Internal filesystem tree corrupt");
@@ -990,7 +1005,7 @@ public:
 			time_t nodeTime;
  			convertToEpochTime(nodeDate, nodeTime);
 
- 			iso9660_dir_add_entry_su(data, node->name.c_str(), node->firstSector, size, flags, &xaAttr, sizeof(xaAttr), &nodeTime, (nodeTimezone * 15));
+ 			iso9660_dir_add_entry_su(data, node->name.c_str(), node->firstSector, size, flags, &xaAttr, sizeof(xaAttr), &nodeTime, (nodeTimezone * 15), nodeY2kbug);
  			
 		}
 
@@ -1325,9 +1340,35 @@ int main(int argc, char ** argv)
 
 		struct tm rootTm;
 		time_t rootTime;
-		iso9660_get_ltime(&cat.creationDate, &rootTm);
+
+		Catalog cat2;
+		cat2.creationDate = cat.creationDate;
+		cat2.modificationDate = cat.modificationDate;
+
+		string creationYear_str = std::string(cat2.creationDate.lt_year, 4);
+		int creationYear_int = std::stoi(std::string(cat2.creationDate.lt_year, 4));
+		if (creationYear_int == 0 || creationYear_int == 100) {
+			cat2.creationDate.lt_year[0] = '2';
+			cat2.creationDate.lt_year[1] = '0';
+			cat2.creationDate.lt_year[2] = '0';
+			cat2.creationDate.lt_year[3] = '0';
+		} else if (creationYear_int > 0 && creationYear_int < 30) {
+			cat2.creationDate.lt_year[0] = '2';
+			cat2.creationDate.lt_year[1] = '0';
+		} else if (creationYear_int >= 70 && creationYear_int < 99) {
+			cat2.creationDate.lt_year[0] = '1';
+			cat2.creationDate.lt_year[1] = '9';
+		} else if (creationYear_int >= 1900 && creationYear_int < 1970) {
+			cat2.creationDate.lt_year[0] = '2';
+			cat2.creationDate.lt_year[1] = '0';
+		}
+
+		iso9660_get_ltime(&cat2.creationDate, &rootTm);
 		rootTime = timegm(&rootTm) - (timeZone * (15 * 60));
 		gmtime_s(&rootTm, &rootTime);
+		if (y2kbug == 1) {
+		  rootTm.tm_year -= 100;
+		}
 
 		iso9660_dir_t rootDirRecord;
 		memset(&rootDirRecord, 0, sizeof(rootDirRecord));
@@ -1335,7 +1376,7 @@ int main(int argc, char ** argv)
 		rootDirRecord.length = to_711(iso9660_dir_calc_record_size(0, 0));
 		rootDirRecord.extent = to_733(rootDirStartSector);
 		rootDirRecord.size = to_733(cat.root->numSectors * ISO_BLOCKSIZE);
-		iso9660_set_dtime_with_timezone(&rootTm, (timeZone * 15), &rootDirRecord.recording_time);
+		iso9660_set_dtime_with_timezone(&rootTm, (timeZone * 15), &rootDirRecord.recording_time, 0);
 		rootDirRecord.file_flags = ISO_DIRECTORY;
 		rootDirRecord.volume_sequence_number = to_723(1);
 		rootDirRecord.filename.len = 1;
@@ -1344,7 +1385,7 @@ int main(int argc, char ** argv)
 		                cat.volumeID.c_str(), cat.publisherID.c_str(), cat.preparerID.c_str(), cat.applicationID.c_str(),
 		                volumeSize, &rootDirRecord,
 		                pathTableStartSector, pathTableStartSector + numPathTableSectors * 2,
-		                pathTables.size(), &rootTime);
+		                pathTables.size(), &rootTime, y2kbug);
 
 		iso9660_strncpy_pad(volumeDesc.system_id, cat.systemID.c_str(), ISO_MAX_SYSTEM_ID, ISO9660_ACHARS);
 		iso9660_strncpy_pad(volumeDesc.volume_set_id, cat.volumeSetID.c_str(), ISO_MAX_VOLUMESET_ID, ISO9660_DCHARS);

@@ -309,13 +309,19 @@ iso9660_get_ltime (const iso9660_ltime_t *p_ldate,
 void
 iso9660_set_dtime_with_timezone (const struct tm *p_tm,
                                  int time_zone,
-                                 /*out*/ iso9660_dtime_t *p_idr_date)
+                                 /*out*/ iso9660_dtime_t *p_idr_date,
+                                 int y2kbug)
 {
   memset (p_idr_date, 0, 7);
 
   if (!p_tm) return;
 
-  p_idr_date->dt_year   = p_tm->tm_year;
+  if (y2kbug == 1) {
+      p_idr_date->dt_year = p_tm->tm_year - 100;
+  } else {
+      p_idr_date->dt_year = p_tm->tm_year;
+  }
+
   p_idr_date->dt_month  = p_tm->tm_mon + 1;
   p_idr_date->dt_day    = p_tm->tm_mday;
   p_idr_date->dt_hour   = p_tm->tm_hour;
@@ -353,7 +359,7 @@ iso9660_set_dtime(const struct tm *p_tm, /*out*/ iso9660_dtime_t *p_idr_date)
     time_zone = (p_tm->tm_isdst > 0) ? -60 : 0;
 #endif
   }
-  iso9660_set_dtime_with_timezone (p_tm, time_zone, p_idr_date);
+  iso9660_set_dtime_with_timezone (p_tm, time_zone, p_idr_date, 0);
 }
 
 /*!
@@ -618,7 +624,8 @@ iso9660_set_pvd(void *pd,
                 uint32_t path_table_l_extent,
                 uint32_t path_table_m_extent,
                 uint32_t path_table_size,
-                const time_t *pvd_time
+                const time_t *pvd_time,
+                int y2kbug
                 )
 {
   iso9660_pvd_t ipd;
@@ -674,6 +681,9 @@ iso9660_set_pvd(void *pd,
   iso9660_strncpy_pad (ipd.abstract_file_id     , "", 37, ISO9660_DCHARS);
   iso9660_strncpy_pad (ipd.bibliographic_file_id, "", 37, ISO9660_DCHARS);
 
+  if (y2kbug == 1) {
+    temp_tm.tm_year -= 100;
+  }
   gmtime_r(pvd_time, &temp_tm);
   iso9660_set_ltime (&temp_tm, &(ipd.creation_date));
   gmtime_r(pvd_time, &temp_tm);
@@ -713,7 +723,8 @@ iso9660_dir_add_entry_su(void *dir,
                          const void *su_data,
                          unsigned int su_size,
                          const time_t *entry_time,
-                         int timezone)
+                         int timezone,
+                         int y2kbug)
 {
   iso9660_dir_t *idr = dir;
   uint8_t *dir8 = dir;
@@ -778,7 +789,7 @@ iso9660_dir_add_entry_su(void *dir,
   idr->size = to_733(size);
 
   gmtime_r(entry_time, &temp_tm);
-  iso9660_set_dtime_with_timezone (&temp_tm, timezone, &(idr->recording_time));
+  iso9660_set_dtime_with_timezone (&temp_tm, timezone, &(idr->recording_time), y2kbug);
 
   idr->file_flags = to_711(file_flags);
 
@@ -801,10 +812,11 @@ iso9660_dir_init_new (void *dir,
                       const time_t *dir_timeS,
                       const time_t *dir_timeP,
                       int timezoneS,
-                      int timezoneP)
+                      int timezoneP,
+                      int y2kbug)
 {
   iso9660_dir_init_new_su (dir, self, ssize, NULL, 0, parent, psize, NULL,
-                           0, dir_timeS, dir_timeP, timezoneS, timezoneP);
+                           0, dir_timeS, dir_timeP, timezoneS, timezoneP, y2kbug);
 }
 
 void
@@ -820,20 +832,32 @@ iso9660_dir_init_new_su (void *dir,
                          const time_t *dir_timeS,
                          const time_t *dir_timeP,
                          int timezoneS,
-                         int timezoneP)
+                         int timezoneP,
+                         int y2kbug)
 {
+  int y2kbugS = 0;
+  int y2kbugP = 0;
   cdio_assert (ssize > 0 && !(ssize % ISO_BLOCKSIZE));
   cdio_assert (psize > 0 && !(psize % ISO_BLOCKSIZE));
   cdio_assert (dir != NULL);
 
   memset (dir, 0, ssize);
+  
+  if (y2kbug == 11) {
+    y2kbugS = 1;
+    y2kbugP = 1;
+  } else if (y2kbug == 10) {
+    y2kbugP = 1;
+  } else if (y2kbug == 1) {
+    y2kbugS = 1;
+  }
 
   /* "\0" -- working hack due to padding  */
   iso9660_dir_add_entry_su (dir, "\0", self, ssize, ISO_DIRECTORY, ssu_data,
-                            ssu_size, dir_timeS, timezoneS);
+                            ssu_size, dir_timeS, timezoneS, y2kbugS);
 
   iso9660_dir_add_entry_su (dir, "\1", parent, psize, ISO_DIRECTORY, psu_data,
-                            psu_size, dir_timeP, timezoneP);
+                            psu_size, dir_timeP, timezoneP, y2kbugP);
 }
 
 /* Zero's out pathable. Do this first.  */

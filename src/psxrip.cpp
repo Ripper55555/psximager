@@ -46,10 +46,12 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXRip v2.2.1 (Win32 by ^Ripper)"
+#define TOOL_VERSION "PSXRip v2.2.2 (Win32 by ^Ripper)"
 #ifdef _WIN32
     #define timegm _mkgmtime
 #endif
+
+bool fixAllDates = false;
 
 // base64 encoded cue file
 string cueFileEncoded = "";
@@ -159,16 +161,18 @@ static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_t
 		rootEntryReplacementTm.tm_hour = std::stoi(hour_str);
 		rootEntryReplacementTm.tm_min = std::stoi(minute_str);
 		rootEntryReplacementTm.tm_sec = std::stoi(second_str);
-		if (rootEntryReplacementTm.tm_year < 10) { 
+		if (rootEntryReplacementTm.tm_year < 70 && fixAllDates == true) { 
 			rootEntryReplacementTm.tm_year = rootEntryReplacementTm.tm_year += 100;
 		}
 	}
 
-	if (century_str == "00" && std::stoi(day_str) >= 1) {
-		if (std::stoi(year_str) > 90) {
-			century_str = "19";
-		} else {
-			century_str = "20";
+	if (fixAllDates == true) {
+		if ((century_str == "00" || century_str == "19") && std::stoi(day_str) >= 1) {
+			if (std::stoi(year_str) >= 70) {
+				century_str = "19";
+			} else {
+				century_str = "20";
+			}
 		}
 	}
 
@@ -235,11 +239,12 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 
 	time_t directoryEpochSelf, directoryEpochParent;
 	char datestringSelf[32], datestringParent[32];
+	int y2k = 0;
 
 	// Process first directory entry "."
 	iso9660_stat_t *statSelf = static_cast<iso9660_stat_t *>(_cdio_list_node_data(node));
 	// Fix broken Y2K dates and the mess libcdio makes with that.
-	if (statSelf->tm.tm_year < 90 || statSelf->tm.tm_year > 130) {
+	if (statSelf->tm.tm_year < 70) {
 		statSelf->tm.tm_year = rootEntryReplacementTm.tm_year;
 		statSelf->tm.tm_mon = rootEntryReplacementTm.tm_mon;
 		statSelf->tm.tm_mday = rootEntryReplacementTm.tm_mday;
@@ -254,12 +259,15 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 		struct tm time_info_val_self = *time_info_self;
 		strftime(datestringSelf, sizeof(datestringSelf), "%Y%m%d%H%M%S", &time_info_val_self);
 	}
+	if (statSelf->y2kbug == 1 && fixAllDates == false) {
+		y2k += 1;
+	}
 
 	node = _cdio_list_node_next(node);
 
 	// Process second directory entry ".."
 	iso9660_stat_t *statParent = static_cast<iso9660_stat_t *>(_cdio_list_node_data(node));
-	if (statParent->tm.tm_year < 90 || statParent->tm.tm_year > 130) {
+	if (statParent->tm.tm_year < 70) {
 		statParent->tm.tm_year = rootEntryReplacementTm.tm_year;
 		statParent->tm.tm_mon = rootEntryReplacementTm.tm_mon;
 		statParent->tm.tm_mday = rootEntryReplacementTm.tm_mday;
@@ -273,6 +281,9 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 		tm* time_info_parent = gmtime(&directoryEpochParent);
 		struct tm time_info_val_parent = *time_info_parent;
 		strftime(datestringParent, sizeof(datestringParent), "%Y%m%d%H%M%S", &time_info_val_parent);
+	}
+	if (statParent->y2kbug == 1 && fixAllDates == false) {
+		y2k += 10;
 	}
 
 	if (level == 0) {
@@ -289,6 +300,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 		catalog << " TIMEZONES" << std::to_string(statSelf->timezone);
 		catalog << " TIMEZONEP" << std::to_string(statParent->timezone);
 		catalog << " HIDDEN" << statSelf->hidden;
+		catalog << " Y2KBUG" << y2k;
 		catalog << " {\n";
 	} else {
 		catalog << string(level * 2, ' ') << "dir " << dirName;
@@ -304,6 +316,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 		catalog << " TIMEZONES" << std::to_string(statSelf->timezone);
 		catalog << " TIMEZONEP" << std::to_string(statParent->timezone);
 		catalog << " HIDDEN" << statSelf->hidden;
+		catalog << " Y2KBUG" << y2k;
 		catalog << " {\n";
 	}
 
@@ -382,6 +395,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 			catalog << " TIMEZONE" << std::to_string(stat->timezone);
 			catalog << " SIZE" << stat->size;
 			catalog << " HIDDEN" << stat->hidden;
+			catalog << " Y2KBUG" << stat->y2kbug;
 
 			// Dump the file contents
 			fs::path outputFileName = outputDirName / entryName;
@@ -591,6 +605,7 @@ static void dumpLBNTable(CdIo_t * image, const string & inputPath = "", ostream 
 static void usage(const char * progname, int exitcode = 0, const string & error = "")
 {
 	cout << "Usage: " << fs::path(progname).filename().string() << " [OPTION...] <input>[.bin/cue] [<output_dir>]" << endl;
+	cout << "  -f, --fix                       Fix problematic file/directory/catalog dates instead of preserving them" << endl;
 	cout << "  -l, --lbns                      Write LBNs to catalog file" << endl;
 	cout << "  -t, --lbn-table                 Print LBN table and exit" << endl;
 	cout << "  -v, --verbose                   Be verbose" << endl;
@@ -620,6 +635,8 @@ int main(int argc, const char ** argv)
 		if (arg == "--version" || arg == "-V") {
 			cout << TOOL_VERSION << endl;
 			return 0;
+		} else if (arg == "--fix" || arg == "-f") {
+			fixAllDates = true;
 		} else if (arg == "--lbns" || arg == "-l") {
 			writeLBNs = true;
 		} else if (arg == "--lbn-table" || arg == "-t") {
