@@ -46,7 +46,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXRip v2.2.2 (Win32 by ^Ripper)"
+#define TOOL_VERSION "PSXRip v2.2.2 (Win32 build by ^Ripper)"
 #ifdef _WIN32
     #define timegm _mkgmtime
 #endif
