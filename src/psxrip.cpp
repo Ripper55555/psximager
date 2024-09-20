@@ -46,7 +46,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXRip v2.2.2 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXRip v2.2.3 (Win32 build by ^Ripper)"
 #ifdef _WIN32
     #define timegm _mkgmtime
 #endif
@@ -428,6 +428,9 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 						}
 					}
 					r = cdio_read_mode2_sector(image, buffer, stat->lsn + sector, 1);
+				} else if (cddaFile) {
+				  cdio_info("Skipping CD-DA file...");
+				  break;
 				} else {
 					r = cdio_read_data_sectors(image, buffer, stat->lsn + sector, blockSize, 1);
 				}
@@ -669,89 +672,85 @@ int main(int argc, const char ** argv)
 
 	try {
 
-		// Open the input image
-		if (inputPath.extension().empty()) {
-			inputPath.replace_extension(".bin");
-		}
+		// Open the input image (Force .cue extension on input argument! Libcdio will moan otherwise.)
+		inputPath.replace_extension(".cue");
 
-		// Open the cue file and encode in base64 string.
-		std::string filePath = inputPath.string();
-		std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
+		int trackNumber = 0;
+		std::vector<std::string> binFiles;
+		fs::path modifiedPath = inputPath;
 
-		if (!file) {
-			throw runtime_error(format("Failed to open the {} file.", filePath));
-		}
-
-		std::streamsize size = file.tellg();
-		file.seekg(0, std::ios::beg);
-
-		std::string cueContent(size, '\0');
-
-		if (!file.read(&cueContent[0], size)) {
-			throw runtime_error(format("Failed to read the {} file.", filePath));
-		}
-
-		file.close();
-
-		cueFileEncoded = base64_encode(cueContent);
-
-		// HACK! Since libcdio has issues with mixed cd's in the bin/cue format and i can't find the problem.
-		// It keeps on finding only 150 sectors (postgap size?) and fails extracting when audio is present.
-		// This strips the audio component of the cue file and have it process the data track only.
-		fs::path backupFile = inputPath;
-		backupFile.replace_extension(inputPath.extension().string() + ".original");
-		if (inputPath.extension() == ".cue") {
-			if (fs::exists(inputPath)) {
-				if (!fs::exists(backupFile)) {
-					fs::rename(inputPath, backupFile);
-					fs::copy_file(backupFile, inputPath);
-				}
-				std::string cueFile = backupFile.generic_string();
-				std::string tempFile = inputPath.generic_string();
-				std::ifstream cue(cueFile);
-				std::ofstream temp(tempFile);
-				std::string line;
-				std::string fileName;
-				bool firstTrackFound = false;
-				while (std::getline(cue, line, '\n')) {
-					if (line.find("FILE") != std::string::npos) {
-						temp << line << std::endl;
-					}
-					else if (line.find("TRACK 01") != std::string::npos) {
-						temp << line << std::endl;
-						firstTrackFound = true;
-					}
-					else if (line.find("INDEX 01") != std::string::npos) {
-						temp << line << std::endl;
-						if(firstTrackFound) break;
-					}
-				}
-				temp.close();
-				cue.close();
+		if (fs::exists(inputPath)) {
+			// Open the cue file and encode in base64 string.
+			std::ifstream file(inputPath, std::ios::in | std::ios::binary | std::ios::ate);
+			if (!file) {
+					throw std::runtime_error("Failed to open the file: " + inputPath.string());
 			}
+
+			std::streamsize size = file.tellg();
+			file.seekg(0, std::ios::beg);
+
+			std::string cueContent(size, '\0');
+			if (!file.read(&cueContent[0], size)) {
+					throw std::runtime_error("Failed to read the file: " + inputPath.string());
+			}
+
+			file.close();
+			cueFileEncoded = base64_encode(cueContent);
+
+			// HACK! Since libcdio has issues with mixed cd's in the bin/cue format and i can't find the problem.
+			// It keeps on finding only 150 sectors (postgap size?) and fails extracting when audio is present.
+			// This strips the audio component of the cue file and have it process the data track only.
+			std::istringstream cueStream(cueContent);
+			std::ostringstream tempStream;
+			std::string line;
+			bool firstTrackFound = false;
+
+			while (std::getline(cueStream, line)) {
+				if (line.find("FILE") != std::string::npos) {
+					tempStream << line << std::endl;
+					size_t start = line.find("\"") + 1;
+					size_t end = line.find("\"", start);
+					binFiles.push_back(line.substr(start, end - start));
+				} else if (line.find("TRACK 01") != std::string::npos) {
+					tempStream << line << std::endl;
+				} else if (line.find("INDEX 01") != std::string::npos) {
+					tempStream << line << std::endl;
+				}
+			}
+
+			// Generate the modified file path with "_Tempfile" appended to the filename
+			modifiedPath.replace_filename(inputPath.stem().string() + "_Tempfile" + inputPath.extension().string());
+
+			// Write the modified content to the temp file
+			std::ofstream modifiedFile(modifiedPath);
+			if (!modifiedFile) {
+				throw std::runtime_error("Failed to create the modified cue file: " + modifiedPath.string());
+			}
+
+			modifiedFile << tempStream.str();
+			modifiedFile.close();
+
+		} else {
+			throw std::runtime_error("Error: '" + inputPath.string() + "' file not found.");
 		}
 
-		CdIo_t * image = cdio_open(inputPath.generic_string().c_str(), DRIVER_BINCUE);
-
-		fs::remove(inputPath);
-		fs::rename(backupFile, inputPath);
-
+		CdIo_t * image = cdio_open(modifiedPath.generic_string().c_str(), DRIVER_BINCUE);
 
 		if (image == NULL) {
-			throw runtime_error(format("Error opening input image {}, or image has wrong type", inputPath.string()));
+			throw runtime_error(format("Error opening input image {}, or image has wrong type", modifiedPath.string()));
 		}
 
 		cout << "Analyzing image " << inputPath << "...\n";
 
 		// Get total sector count of track 1
 		lsn_t last_lsnTrack1 = cdio_get_track_last_lsn(image, 1) + 1; // Zero based, so 0 is sector 1
-		cdio_info("Track 1 sector count: %d", last_lsnTrack1);
+		cdio_info("Track 1 sector count = %d", last_lsnTrack1);
 
 		// Get postgap sector count of track 1
 		msf_t msfTrack1;
 		cdio_get_track_msf(image, 1, &msfTrack1);
 		int track1PostgapSectors = msfTrack1.m * CDIO_CD_SECS_PER_MIN * CDIO_CD_FRAMES_PER_SEC + msfTrack1.s * CDIO_CD_FRAMES_PER_SEC + msfTrack1.f;
-		cdio_info("Track 1 postgap sectors: %d", track1PostgapSectors);
+		cdio_info("Track 1 postgap sectors = %d", track1PostgapSectors);
 		
 		if (track1PostgapSectors > 1) {
 			char postGapBuffer[CDIO_CD_FRAMESIZE_RAW];
@@ -774,44 +773,30 @@ int main(int argc, const char ** argv)
 			} else {
 				track1PostgapType = 0; // Unknown, possibly dump it raw. Need to write that.
 			}
-			cdio_info("Track 1 postgap type: %d", track1PostgapType);
+			cdio_info("Track 1 postgap type = %d", track1PostgapType);
 		}
 		
 		// Get the number of tracks and total sector sizes of each track including pregap/postgap
-		int trackNumber = 0;
-		std::ifstream cueFile(inputPath.generic_string());
-		std::string line;
-		std::vector<std::string> binFiles;
-		while (std::getline(cueFile, line)) {
-			if (line.substr(0, 4) == "FILE") {
-				size_t start = line.find("\"") + 1;
-				size_t end = line.find("\"", start);
-				binFiles.push_back(line.substr(start, end - start));
-			}
-		}
-		cueFile.close();
-
 		for (const auto & binFile : binFiles) {
 			trackNumber++;
-			fs::path filePath(binFile);
-			std::string binFileWithoutPath = filePath.filename().string();
-			std::ifstream file;
-			int size, sectors;
-			if (fs::exists(filePath)) {
-				file.open(binFile, std::ios::binary);
+			fs::path binFileFullPath = inputPath.parent_path() / binFile;
+			std::string binFileFullPathStr = binFileFullPath.string();
+			std::string binFileWithoutPath = binFile.c_str();
+			int sectors;
+
+			if (fs::exists(binFileFullPathStr)) {
+				auto size = fs::file_size(binFileFullPathStr);
+				sectors = size / CDIO_CD_FRAMESIZE_RAW;
 			} else if (fs::exists(binFileWithoutPath)) {
-				std::cout << "WARNING! Incorrect path in .CUE file. However .BIN file was found in the same directory as the .CUE" << std::endl;
-				file.open(binFileWithoutPath, std::ios::binary);
+				std::cout << "WARNING! Incorrect path in .CUE file. However .BIN file was found in the same directory as the .CUE file." << std::endl;
+				auto size = fs::file_size(binFileWithoutPath);
+				sectors = size / CDIO_CD_FRAMESIZE_RAW;
 			} else {
 				std::cout << "Error: " << binFile << " or " << binFileWithoutPath << " does not exist or is not readable." << std::endl;
 				continue;
 			}
 
-			file.seekg(0, std::ios::end);
-			size = file.tellg();
-			sectors = size / CDIO_CD_FRAMESIZE_RAW;
-			file.close();
-			cdio_info((std::string("Number of sectors in ") + binFileWithoutPath + ": %d").c_str(), sectors);
+			cdio_info((std::string("Number of sectors in \"") + binFileWithoutPath + "\" = %d").c_str(), sectors);
 
 			if (trackNumber > 1) {
 				audioSectors += sectors;
@@ -872,6 +857,11 @@ int main(int argc, const char ** argv)
 		// Close the input image
 		cdio_destroy(image);
 		cdio_info("Done.");
+		
+		// Remove modified .cue file
+		if (!modifiedPath.empty() && fs::exists(modifiedPath)) {
+			fs::remove(modifiedPath);
+		}
 
 	} catch (const std::exception & e) {
 		cerr << e.what() <<endl;

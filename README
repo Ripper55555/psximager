@@ -1,4 +1,4 @@
-PSXImager V2.2.2 (Win32 build by ^Ripper)
+PSXImager V2.2.3 (Win32 build by ^Ripper)
 
 Important!
 This patch has been made for a specific game I'm working on, but can
@@ -9,7 +9,7 @@ The catalog file has now been extended to include all relevant information.
 This means that you can make a 1:1 perfect rebuild of the ripped ISO.
 
 There is a caveat though.
-If the original ISO had been build with buggy tools or special data had
+If the original ISO had been built with buggy tools or special data had
 been inserted then a full 1:1 rebuild will fail.
 But a good file compare program can show you how well it works.
 
@@ -45,6 +45,12 @@ Some of the fixes include:
   Now even more ISO's rebuild 1:1 out of the box.
   Psxrip now has a --fix switch to override preservation and fix the
   obvious broken dates instead.
+- Buggy/incomplete libcdio parsing of .cue file partially fixed.
+  Instead of defaulting to the same filename for both the .cue and .bin file
+  it now uses the parsed .cue data for the filename of the datatrack.
+- Audio tracks are not extracted as of now due to bugs in libcdio multi-
+  track/file support. However since they already exist as separate .bin files
+  its not a big issue. In the extract folder they appear as 0 byte files.
 
 ^Ripper
 
