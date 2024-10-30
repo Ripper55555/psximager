@@ -1,8 +1,16 @@
-PSXImager V2.2.3 (Win32 build by ^Ripper)
+PSXImager V2.2.4 (Win32 build by ^Ripper)
+=========================================
 
-Important!
-This patch has been made for a specific game I'm working on, but can
+**Important**
+This fork build has been made for a specific game I'm working on, but can
 also be used for other projects.
+
+Its aim is to dump the ISO to the harddisk for ease of editing.
+After which the psxbuild program rebuilds it back to a CD image.
+This process mimics mastering so well that an unedited version usually
+produces a 1:1 ISO with the same checksum. That way you know the files
+are always at the same sector number and nothing has been altered.
+So this provides a solid basis for editing the game.
 
 Changes have been made in how the directory is being rebuilt.
 The catalog file has now been extended to include all relevant information.
@@ -11,7 +19,8 @@ This means that you can make a 1:1 perfect rebuild of the ripped ISO.
 There is a caveat though.
 If the original ISO had been built with buggy tools or special data had
 been inserted then a full 1:1 rebuild will fail.
-But a good file compare program can show you how well it works.
+But a good file compare program can show you how well it worked and show
+you the extra/odd data put in.
 
 Libcdio has been patched to fix issues or missing functions.
 Some of the fixes include:
@@ -30,27 +39,27 @@ Some of the fixes include:
   - TIMEZONES / TIMEZONEP (Directory self/parent entry . and ..)
   - SIZE (File)
   - HIDDEN
-  - ZEROEDC (automatic detection if xafile has zero'd out EDC checksum)
+  - Y2KBUG (Marker for when the date on the ISO is problematic)
+  - ZEROEDC (Automatic detection if xafile has zero'd out EDC checksum)
   - Full copy of the .CUE file in base64 when ripped.
     For use in rebuilding a new .CUE file.
   - Rebuild the postgap of the data track that is missing.
     Data track 1 sector count, postgap sector count and postgap type.
     Postgap type can detect 3 common types or defaults to all zero's.
-- Audio track locations are now compensated.
+- Audio track locations in the data tracks TOC are now compensated.
+  Some games use these entries for fine audio control.
   The sector start address should change when the ISO grows / shrinks.
-  Nothing changes for tracks 2+ and are re-used in the recreation
-  of the .cue file if -c is used.
-  So you can have the original and rebuild ISO share tracks 2+.
+  In the destination folder they appear as 0 byte reference files.
 - Y2K timestamps on the catalog/files/directories are now fully restorable.
-  Now even more ISO's rebuild 1:1 out of the box.
   Psxrip now has a --fix switch to override preservation and fix the
   obvious broken dates instead.
-- Buggy/incomplete libcdio parsing of .cue file partially fixed.
+- Buggy/incomplete libcdio parsing of .cue file fixed (good enough).
   Instead of defaulting to the same filename for both the .cue and .bin file
-  it now uses the parsed .cue data for the filename of the datatrack.
-- Audio tracks are not extracted as of now due to bugs in libcdio multi-
-  track/file support. However since they already exist as separate .bin files
-  its not a big issue. In the extract folder they appear as 0 byte files.
+  it now uses the parsed .cue data for the filename of the tracks.
+  The correct file will load when a sector gets read.
+- Audio tracks are now fully extracted to the destination folder.
+  For ease, they are converted to .wav files for playback and editing.
+  They are also converted back to audio tracks when rebuilding the ISO.
 
 ^Ripper
 

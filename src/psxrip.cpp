@@ -41,14 +41,15 @@ extern "C" {
 #include <regex>
 #include <string>
 #include <stdexcept>
+#include <stdio.h>
 #include <time.h>
 #include <vector>
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXRip v2.2.3 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXRip v2.2.4 (Win32 build by ^Ripper)"
 #ifdef _WIN32
-    #define timegm _mkgmtime
+	#define timegm _mkgmtime
 #endif
 
 bool fixAllDates = false;
@@ -177,9 +178,9 @@ static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_t
 	}
 
 	f << format("{:.2}{:.2}-{:.2}-{:.2} {:.2}:{:.2}:{:.2}.{:.2} {}",
-	     century_str, year_str, l.lt_month, l.lt_day,
-	     l.lt_hour, l.lt_minute, l.lt_second, l.lt_hsecond,
-	     int(l.lt_gmtoff)) << endl;
+		century_str, year_str, l.lt_month, l.lt_day,
+		l.lt_hour, l.lt_minute, l.lt_second, l.lt_hsecond,
+		int(l.lt_gmtoff)) << endl;
 }
 
 
@@ -365,7 +366,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 				uint16_t attr = uint16_from_be(stat->xa.attributes);
 				if (attr & (XA_ATTR_MODE2FORM2 | XA_ATTR_INTERLEAVED)) {
 					cdio_info("XA file '%s' size = %u, secsize = %u, group_id = %d, user_id = %d, attributes = %04x, filenum = %d",
-					          entryName.c_str(), stat->size, stat->secsize, stat->xa.group_id, stat->xa.user_id, attr, stat->xa.filenum);
+					entryName.c_str(), stat->size, stat->secsize, stat->xa.group_id, stat->xa.user_id, attr, stat->xa.filenum);
 					form2File = true;
 				}
 
@@ -675,10 +676,6 @@ int main(int argc, const char ** argv)
 		// Open the input image (Force .cue extension on input argument! Libcdio will moan otherwise.)
 		inputPath.replace_extension(".cue");
 
-		int trackNumber = 0;
-		std::vector<std::string> binFiles;
-		fs::path modifiedPath = inputPath;
-
 		if (fs::exists(inputPath)) {
 			// Open the cue file and encode in base64 string.
 			std::ifstream file(inputPath, std::ios::in | std::ios::binary | std::ios::ate);
@@ -697,64 +694,129 @@ int main(int argc, const char ** argv)
 			file.close();
 			cueFileEncoded = base64_encode(cueContent);
 
-			// HACK! Since libcdio has issues with mixed cd's in the bin/cue format and i can't find the problem.
-			// It keeps on finding only 150 sectors (postgap size?) and fails extracting when audio is present.
-			// This strips the audio component of the cue file and have it process the data track only.
-			std::istringstream cueStream(cueContent);
-			std::ostringstream tempStream;
-			std::string line;
-			bool firstTrackFound = false;
-
-			while (std::getline(cueStream, line)) {
-				if (line.find("FILE") != std::string::npos) {
-					tempStream << line << std::endl;
-					size_t start = line.find("\"") + 1;
-					size_t end = line.find("\"", start);
-					binFiles.push_back(line.substr(start, end - start));
-				} else if (line.find("TRACK 01") != std::string::npos) {
-					tempStream << line << std::endl;
-				} else if (line.find("INDEX 01") != std::string::npos) {
-					tempStream << line << std::endl;
-				}
-			}
-
-			// Generate the modified file path with "_Tempfile" appended to the filename
-			modifiedPath.replace_filename(inputPath.stem().string() + "_Tempfile" + inputPath.extension().string());
-
-			// Write the modified content to the temp file
-			std::ofstream modifiedFile(modifiedPath);
-			if (!modifiedFile) {
-				throw std::runtime_error("Failed to create the modified cue file: " + modifiedPath.string());
-			}
-
-			modifiedFile << tempStream.str();
-			modifiedFile.close();
-
 		} else {
 			throw std::runtime_error("Error: '" + inputPath.string() + "' file not found.");
 		}
 
-		CdIo_t * image = cdio_open(modifiedPath.generic_string().c_str(), DRIVER_BINCUE);
+ 		CdIo_t * image = cdio_open(inputPath.generic_string().c_str(), DRIVER_BINCUE);
 
 		if (image == NULL) {
-			throw runtime_error(format("Error opening input image {}, or image has wrong type", modifiedPath.string()));
+			throw runtime_error(format("Error opening input image {}, or image has wrong type", inputPath.string()));
 		}
 
 		cout << "Analyzing image " << inputPath << "...\n";
 
-		// Get total sector count of track 1
-		lsn_t last_lsnTrack1 = cdio_get_track_last_lsn(image, 1) + 1; // Zero based, so 0 is sector 1
-		cdio_info("Track 1 sector count = %d", last_lsnTrack1);
+		// Get the TOC (Table of Contents) of the CD
+		track_t first_track = cdio_get_first_track_num(image);
+		track_t last_track = cdio_get_last_track_num(image);
+		if (last_track > first_track) {
+			cout << "Dumping audio tracks to directory " << outputPath << "...\n";
+		}
 
-		// Get postgap sector count of track 1
-		msf_t msfTrack1;
-		cdio_get_track_msf(image, 1, &msfTrack1);
-		int track1PostgapSectors = msfTrack1.m * CDIO_CD_SECS_PER_MIN * CDIO_CD_FRAMES_PER_SEC + msfTrack1.s * CDIO_CD_FRAMES_PER_SEC + msfTrack1.f;
-		cdio_info("Track 1 postgap sectors = %d", track1PostgapSectors);
+		// Iterate through the tracks to find the audio track
+		lsn_t track1PostgapSectors = 150;
+		lsn_t last_lsnTrack1 = 0;
+		discmode_t discMode = cdio_get_discmode(image);
 		
-		if (track1PostgapSectors > 1) {
+		for (track_t track = first_track; track <= last_track; track++) {
+			track_format_t format = cdio_get_track_format(image, track);
+
+			// Get the start and end sector of the track
+			lsn_t pregap_sector = cdio_get_track_pregap_lba(image, track);         // Pregap size
+			pregap_sector = (pregap_sector < 0 && track == 1 ? 0 : pregap_sector); // Track 1 always has a negative bogus number for pregap
+			lsn_t start_sector = cdio_get_track_lba(image, track);                 // The actual start before pregap
+			lsn_t data_sector = start_sector + pregap_sector;                      // After pregap where the actual data is
+			lsn_t end_sector = cdio_get_track_last_lsn(image, track);              // Last sector
+			lsn_t total_sector = cdio_get_track_sec_count(image, track);           // Total sector amount
+
+			if (track == last_track) {           // Issue with the last track. Always +150 sectors. The faked lead out?
+				total_sector = total_sector - 150; // When there is only a data track, then this also counts as "last track".
+			}
+
+			if (discMode == 3 && track != last_track) { // Disc mode (Mixed mode) issue.
+				end_sector = end_sector + 150;            // cdio_get_track_last_lsn() under reports by 150 sectors all but the last track.
+			}                                           // This does not happen in XA mode when you strip the audio from the .cue file.
+
+			if (track == 1) {
+				last_lsnTrack1 = end_sector;
+			}
+
+			const char *format_str = (format >= 0 && format < 6) ? track_format2str[format] : "error";
+			cdio_info("Track %02d [%-5s] Pregap: %7d, Start: %7d, Data offset: %7d, End: %7d, Size: %7d",
+									track, format_str, pregap_sector, start_sector, data_sector, end_sector, total_sector);
+
+			// Check if the track is an audio track
+			if (format == TRACK_FORMAT_AUDIO) {
+				audioSectors += total_sector; // including pregap for whole .bin file.
+
+				// Create a filename based on the track number
+				char filename[50];
+				sprintf(filename, "Audio Track %02d.wav", track);
+
+				fs::path fullPathAudio = outputPath / filename;
+				std::string fullPathAudioStr = fullPathAudio.string();
+
+				// Ensure the output directory exists
+				if (!fs::exists(outputPath)) {
+					if (!fs::create_directories(outputPath)) {
+						printf("Failed to create output directory\n");
+						return 1;
+					}
+				}
+
+				// Open a file to write the audio data
+				FILE *audio_file = fopen(fullPathAudioStr.c_str(), "wb");
+				if (audio_file == NULL) {
+					printf("Failed to open output file\n");
+					return 1;
+				}
+
+				// Calculate the size of the audio data in bytes
+				uint32_t data_size = (total_sector - pregap_sector) * CDIO_CD_FRAMESIZE_RAW;
+
+				const uint8_t wav_header[44] = {
+					'R', 'I', 'F', 'F', 0, 0, 0, 0, // Chunk ID and Chunk Size (to be set)
+					'W', 'A', 'V', 'E',             // Format
+					'f', 'm', 't', ' ',             // Subchunk1 ID
+					16, 0, 0, 0,                    // Subchunk1 Size (16 for PCM)
+					1, 0,                           // Audio Format (1 for PCM)
+					2, 0,                           // Num Channels (2 for stereo)
+					0x44, 0xAC, 0x00, 0x00,         // Sample Rate (44100 Hz)
+					0x10, 0xB1, 0x02, 0x00,         // Byte Rate (44100 * 2 * 16/8)
+					4, 0,                           // Block Align (NumChannels * BitsPerSample/8)
+					16, 0,                          // Bits per Sample (16)
+					'd', 'a', 't', 'a', 0, 0, 0, 0  // Subchunk2 ID and Subchunk2 Size (to be set)
+				};
+
+				// Copy the static header and set file-specific sizes
+				uint8_t header[44];
+				memcpy(header, wav_header, 44);
+				*(uint32_t *)(header + 4) = 36 + data_size; // Chunk Size
+				*(uint32_t *)(header + 40) = data_size;     // Subchunk2 Size
+
+				// Write WAV header
+				fwrite(header, 1, 44, audio_file);
+
+				// Read each sector and write audio data to the file
+				uint8_t buffer[CDIO_CD_FRAMESIZE_RAW];
+				for (lsn_t sector = data_sector; sector <= end_sector; sector++) {
+					cdio_read_audio_sector(image, buffer, sector);
+					fwrite(buffer, 1, CDIO_CD_FRAMESIZE_RAW, audio_file);
+				}
+
+				fclose(audio_file);
+			}
+		}
+
+		// Get total sector count of track 1.
+		cdio_info("Track 1 sector count = %d", last_lsnTrack1 + 1);
+
+		// Processing postgap of the data track.
+		cdio_info("Track 1 postgap sectors = %d", track1PostgapSectors);
+
+		if (track1PostgapSectors >= 150) {
 			char postGapBuffer[CDIO_CD_FRAMESIZE_RAW];
-			driver_return_code_t r = cdio_read_audio_sectors(image, postGapBuffer, (last_lsnTrack1 - 1), 1);
+			driver_return_code_t r = cdio_read_audio_sectors(image, postGapBuffer, (last_lsnTrack1), 1);
 			if (r != DRIVER_OP_SUCCESS) {
 			  throw runtime_error(format("Error reading sector {} of image file: {}", (last_lsnTrack1 - 1), cdio_driver_errmsg(r)));
 			}
@@ -773,40 +835,12 @@ int main(int argc, const char ** argv)
 			} else {
 				track1PostgapType = 0; // Unknown, possibly dump it raw. Need to write that.
 			}
-			cdio_info("Track 1 postgap type = %d", track1PostgapType);
-		}
-		
-		// Get the number of tracks and total sector sizes of each track including pregap/postgap
-		for (const auto & binFile : binFiles) {
-			trackNumber++;
-			fs::path binFileFullPath = inputPath.parent_path() / binFile;
-			std::string binFileFullPathStr = binFileFullPath.string();
-			std::string binFileWithoutPath = binFile.c_str();
-			int sectors;
-
-			if (fs::exists(binFileFullPathStr)) {
-				auto size = fs::file_size(binFileFullPathStr);
-				sectors = size / CDIO_CD_FRAMESIZE_RAW;
-			} else if (fs::exists(binFileWithoutPath)) {
-				std::cout << "WARNING! Incorrect path in .CUE file. However .BIN file was found in the same directory as the .CUE file." << std::endl;
-				auto size = fs::file_size(binFileWithoutPath);
-				sectors = size / CDIO_CD_FRAMESIZE_RAW;
-			} else {
-				std::cout << "Error: " << binFile << " or " << binFileWithoutPath << " does not exist or is not readable." << std::endl;
-				continue;
-			}
-
-			cdio_info((std::string("Number of sectors in \"") + binFileWithoutPath + "\" = %d").c_str(), sectors);
-
-			if (trackNumber > 1) {
-				audioSectors += sectors;
-			}
 		}
 
-		cdio_info("Audio sectors = %d", audioSectors);
+		cdio_info("Track 2+ audio sectors = %d", audioSectors);
 
 		// Is it the correct type?
-		discmode_t discMode = cdio_get_discmode(image);
+		// discmode_t discMode = cdio_get_discmode(image); // Already declared earlier.
 		cdio_info("Disc mode = %d", discMode);
 		switch (discMode) {
 			case CDIO_DISC_MODE_CD_DATA:
@@ -851,18 +885,13 @@ int main(int argc, const char ** argv)
 		} else {
 
 			// Dump the input image
-			dumpImage(image, outputPath, writeLBNs, track1PostgapSectors, track1PostgapType, last_lsnTrack1);
+			dumpImage(image, outputPath, writeLBNs, track1PostgapSectors, track1PostgapType, last_lsnTrack1 + 1);
 		}
 
 		// Close the input image
 		cdio_destroy(image);
 		cdio_info("Done.");
 		
-		// Remove modified .cue file
-		if (!modifiedPath.empty() && fs::exists(modifiedPath)) {
-			fs::remove(modifiedPath);
-		}
-
 	} catch (const std::exception & e) {
 		cerr << e.what() <<endl;
 		return 1;

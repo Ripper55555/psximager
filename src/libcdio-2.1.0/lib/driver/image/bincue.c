@@ -88,6 +88,47 @@ static lsn_t get_disc_last_lsn_bincue(void *p_user_data);
 #include "image_common.h"
 static bool parse_cuefile(_img_private_t *cd, const char *toc_name);
 
+#ifdef _WIN32
+#include <windows.h>
+
+unsigned long get_file_size(const char *filename);
+unsigned long get_file_size(const char *filename) {
+    // Use Windows API to get the file size
+    DWORD fileSize;
+    HANDLE hFile = CreateFile(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return 0;  // If the file cannot be opened
+    }
+
+    fileSize = GetFileSize(hFile, NULL);
+    CloseHandle(hFile);
+    return (unsigned long)fileSize;
+}
+#else
+#include <sys/stat.h>
+
+unsigned long get_file_size(const char *filename) {
+    struct stat st;
+    if (stat(filename, &st) == 0) {
+        return st.st_size;
+    }
+    return 0;  // Return 0 if the file size could not be determined
+}
+#endif
+
+// Function to get the sector count from the bin file, accounting for pregap
+static unsigned long get_track_sector_count(const char *filename, int sector_size, int pregap_sectors) {
+    unsigned long file_size = get_file_size(filename);
+    if (file_size > 0) {
+        unsigned long total_sectors = file_size / sector_size;  // Divide by sector size (e.g., 2352)
+        if (pregap_sectors > 0) {
+            total_sectors -= pregap_sectors;  // Subtract pregap sectors if necessary
+        }
+        return total_sectors;
+    }
+    return 0;  // If file size couldn't be determined
+}
+
 /*!
   Initialize image structures.
  */
@@ -109,9 +150,9 @@ _init_bincue(_img_private_t *p_env)
 
   /* Read in CUE sheet. */
   if ( !parse_cuefile(p_env, p_env->psz_cue_name) ) return false;
- 
+
   /* Replace the .bin filename with the actual file supplied in the .cue file instead of defaulting to the same name as the .cue file. */
-  p_env->gen.source_name = strdup (p_env->tocent[p_env->pos.index].filename); // Can also hardcode "0" instead of p_env->pos.index due to only processing the first track. 
+  p_env->gen.source_name = strdup (p_env->tocent[p_env->pos.index].filename);
   
   if (!(p_env->gen.data_source = cdio_stdio_new (p_env->gen.source_name))) {
     cdio_warn ("init failed");
@@ -239,28 +280,28 @@ _read_bincue (void *p_user_data, void *data, size_t size)
 /*!
    Return the size of the CD in logical block address (LBA) units.
  */
-static lsn_t
-get_disc_last_lsn_bincue (void *p_user_data)
-{
-  _img_private_t *p_env = p_user_data;
-  off_t size;
+static lsn_t get_disc_last_lsn_bincue(void *p_user_data) {
+    _img_private_t *p_env = (_img_private_t *)p_user_data;
+    lsn_t total_sectors = 0;
+    unsigned long track_sectors;
 
-  size = cdio_stream_stat (p_env->gen.data_source);
+    for (int track = p_env->gen.i_first_track; track <= p_env->gen.i_tracks; track++) {
+        // Get the filename for the current track
+        const char *filename = p_env->tocent[track - p_env->gen.i_first_track].filename;
+        int sector_size = CDIO_CD_FRAMESIZE_RAW;  // Default sector size
 
-  if (size % CDIO_CD_FRAMESIZE_RAW)
-    {
-      cdio_warn ("image %s size (%" PRId64 ") not multiple of blocksize (%d)",
-                 p_env->gen.source_name, (int64_t)size, CDIO_CD_FRAMESIZE_RAW);
-      if (size % M2RAW_SECTOR_SIZE == 0)
-        cdio_warn ("this may be a 2336-type disc image");
-      else if (size % CDIO_CD_FRAMESIZE_RAW == 0)
-        cdio_warn ("this may be a 2352-type disc image");
-      /* exit (EXIT_FAILURE); */
+        // Calculate the number of sectors in this track
+        track_sectors = get_track_sector_count(filename, sector_size, 0);
+
+        if (track_sectors == 0) {
+            cdio_warn("Failed to determine sector count for file: %s", filename);
+            continue;
+        }
+
+        total_sectors += track_sectors;
     }
 
-  size /= CDIO_CD_FRAMESIZE_RAW;
-
-  return (lsn_t)size;
+    return total_sectors;
 }
 
 #define MAXLINE 4096            /* maximum line length + 1 */
@@ -765,52 +806,44 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
 #ifdef FIXME
               cd->tocent[i].indexes[cd->tocent[i].nindex++] = lba;
 #else
-              track_info_t  *this_track=
-                &(cd->tocent[cd->gen.i_tracks - 1]);
+              // PSX data track has NO pregap but an implied postgap of 150 sectors.
+              // Mixed mode PSX / regular audio tracks have index 00 silence AND a set pregap derrived from index 01
+              track_info_t *this_track = &(cd->tocent[cd->gen.i_tracks - 1]);
+              track_info_t *prev_track = &(cd->tocent[cd->gen.i_tracks - 2]);
+              const char *track_filename = cd->tocent[cd->gen.i_tracks - 1].filename;
+              unsigned long sector_count = 0;
 
               switch (start_index) {
 
               case 0:
-                lba += CDIO_PREGAP_SECTORS;
+
                 this_track->pregap = lba;
                 break;
 
               case 1:
+
                 if (!b_first_index_for_track) {
-                  lba += CDIO_PREGAP_SECTORS;
                   cdio_lba_to_msf(lba, &(this_track->start_msf));
                   b_first_index_for_track = true;
                   this_track->start_lba   = lba;
                 }
 
+                this_track->pregap = lba;
+
+                // Calculate the sector count for the current track based on file size.
+                // Sector count is the data without pregap.
+                sector_count = get_track_sector_count(track_filename, CDIO_CD_FRAMESIZE_RAW, this_track->pregap);
+
+                // Set the sector count. Calculated excluding pregap as per spec.
+                this_track->sec_count = sector_count;
+
+                // Cumulative LBA calculation
                 if (cd->gen.i_tracks > 1) {
-                  /* Figure out number of sectors for previous track */
-                  track_info_t *prev_track=&(cd->tocent[cd->gen.i_tracks-2]);
-                  if ( this_track->start_lba < prev_track->start_lba ) {
-                    cdio_log (log_level,
-                              "track %d at LBA %lu starts before track %d at LBA %lu",
-                              cd->gen.i_tracks,
-                              (unsigned long int) this_track->start_lba,
-                              cd->gen.i_tracks,
-                              (unsigned long int) prev_track->start_lba);
-                    prev_track->sec_count = 0;
-                  } else if ( this_track->start_lba >= prev_track->start_lba
-                              + CDIO_PREGAP_SECTORS ) {
-                    prev_track->sec_count = this_track->start_lba -
-                      prev_track->start_lba - CDIO_PREGAP_SECTORS ;
-                  } else {
-                    cdio_log (log_level,
-                              "%lu fewer than pregap (%d) sectors in track %d",
-                              (long unsigned int)
-                              this_track->start_lba - prev_track->start_lba,
-                              CDIO_PREGAP_SECTORS,
-                              cd->gen.i_tracks);
-                    /* Include pregap portion in sec_count. Maybe the pregap
-                       was omitted. */
-                    prev_track->sec_count = this_track->start_lba -
-                      prev_track->start_lba;
-                  }
+                  lba = prev_track->start_lba + prev_track->pregap + prev_track->sec_count;
+                  cdio_lba_to_msf(lba, &(this_track->start_msf));
+                  this_track->start_lba = lba;      
                 }
+
                 this_track->num_indices++;
                 break;
 
@@ -875,6 +908,54 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
 
 }
 
+/* Checks if the LSN is within the active file's range, and updates the data source if not. */
+static bool
+_switch_data_source_if_needed(_img_private_t *p_env, lsn_t *lsn)
+{
+  int track;
+  int lsnRequest = *lsn;
+
+  /* Iterate over all tracks to find the correct file for the given LSN */
+  for (track = p_env->gen.i_first_track; track <= p_env->gen.i_tracks; track++) {
+    lsn_t start_lba = p_env->tocent[track - p_env->gen.i_first_track].start_lba;
+    lsn_t sec_count = p_env->tocent[track - p_env->gen.i_first_track].sec_count;
+    lsn_t end_lba = start_lba + sec_count + p_env->tocent[track - p_env->gen.i_first_track].pregap - 1;
+
+    /* Check if the given LSN falls within this track's LBA range */
+    if (*lsn >= start_lba && *lsn <= end_lba) {
+      /* If we're already using the correct file, return true */
+      if (strcmp(p_env->gen.source_name, p_env->tocent[track - p_env->gen.i_first_track].filename) == 0) {
+        *lsn -= start_lba;  // Adjust LSN relative to the start of this track
+        return true;
+      }
+
+      /* Update source_name and data_source to the correct file */
+      free(p_env->gen.source_name);
+      p_env->gen.source_name = strdup(p_env->tocent[track - p_env->gen.i_first_track].filename);
+
+      /* Reinitialize the data source with the new file */
+      if (p_env->gen.data_source) {
+        cdio_stream_close(p_env->gen.data_source);
+      }
+      p_env->gen.data_source = cdio_stdio_new(p_env->gen.source_name);
+
+      if (!p_env->gen.data_source) {
+        cdio_warn("Failed to open the .bin file: %s", p_env->gen.source_name);
+        return false;
+      }
+      
+      /* Successfully switched the data source; adjust LSN for the file's offset */
+      *lsn -= start_lba;  // Adjust LSN to be relative to the track start
+      cdio_log(CDIO_LOG_INFO, "Switched to file %s for LSN %d. Track file offset LSN %d", p_env->gen.source_name, lsnRequest, *lsn);
+      return true;
+    }
+  }
+
+  /* LSN not found in any track */
+  cdio_warn("LSN %d out of range in the available tracks", *lsn);
+  return false;
+}
+
 /*!
    Reads a single audio sector from CD device into data starting
    from lsn. Returns 0 if no error.
@@ -885,6 +966,12 @@ _read_audio_sectors_bincue (void *p_user_data, void *data, lsn_t lsn,
 {
   _img_private_t *p_env = p_user_data;
   int ret;
+
+  /* Ensure the data source is correctly set for the requested LSN */
+  if (!_switch_data_source_if_needed(p_env, &lsn)) {
+    cdio_warn("Failed to switch to the appropriate .bin file for LSN %d", lsn);
+    return false;
+  }
 
   ret = cdio_stream_seek (p_env->gen.data_source,
             lsn * CDIO_CD_FRAMESIZE_RAW, SEEK_SET);
@@ -909,6 +996,12 @@ _read_mode1_sector_bincue (void *p_user_data, void *data, lsn_t lsn,
   int ret;
   char buf[CDIO_CD_FRAMESIZE_RAW] = { 0, };
   int blocksize = CDIO_CD_FRAMESIZE_RAW;
+
+  /* Ensure the data source is correctly set for the requested LSN */
+  if (!_switch_data_source_if_needed(p_env, &lsn)) {
+    cdio_warn("Failed to switch to the appropriate .bin file for LSN %d", lsn);
+    return false;
+  }
 
   ret = cdio_stream_seek (p_env->gen.data_source, lsn * blocksize, SEEK_SET);
   if (ret!=0) return ret;
@@ -965,6 +1058,12 @@ _read_mode2_sector_bincue (void *p_user_data, void *data, lsn_t lsn,
   */
 
   int blocksize = CDIO_CD_FRAMESIZE_RAW;
+
+  /* Ensure the data source is correctly set for the requested LSN */
+  if (!_switch_data_source_if_needed(p_env, &lsn)) {
+    cdio_warn("Failed to switch to the appropriate .bin file for LSN %d", lsn);
+    return false;
+  }
 
   ret = cdio_stream_seek (p_env->gen.data_source, lsn * blocksize, SEEK_SET);
   if (ret!=0) return ret;
