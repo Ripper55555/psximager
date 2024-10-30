@@ -49,7 +49,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXBuild v2.2.4 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXBuild v2.2.5 (Win32 build by ^Ripper)"
 #ifdef _WIN32
     #define timegm _mkgmtime
 #endif
@@ -225,7 +225,7 @@ void writeBinWithPregap(std::vector<CueTrackInfo>& tracks, const std::filesystem
         // Process only AUDIO tracks
         if (track.trackType == "AUDIO") {
             // Generate the new WAV filename
-            std::string wavFileName = baseNameWav + "/" + "Audio Track " + (track.trackNumber < 10 ? "0" : "") + std::to_string(track.trackNumber) + ".wav";
+            std::string wavFileName = baseNameWav + "/" + "Track_" + (track.trackNumber < 10 ? "0" : "") + std::to_string(track.trackNumber) + ".wav";
             std::filesystem::path fullPathWav = inputDir / wavFileName;
 
             // Create the .bin filename in the format "outputname_trackXX.bin" where XX is the track number

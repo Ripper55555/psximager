@@ -47,7 +47,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXRip v2.2.4 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXRip v2.2.5 (Win32 build by ^Ripper)"
 #ifdef _WIN32
 	#define timegm _mkgmtime
 #endif
@@ -751,7 +751,7 @@ int main(int argc, const char ** argv)
 
 				// Create a filename based on the track number
 				char filename[50];
-				sprintf(filename, "Audio Track %02d.wav", track);
+				sprintf(filename, "Track_%02d.wav", track);
 
 				fs::path fullPathAudio = outputPath / filename;
 				std::string fullPathAudioStr = fullPathAudio.string();
