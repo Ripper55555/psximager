@@ -45,16 +45,16 @@ You can build PSXImager for Windows using the MSYS2 environment.
      mkdir psximager
      cd psximager
 
-  6. Download the psximager-v2.2.4 github release.
+  6. Download the psximager-v2.2.5 github release.
 
-     wget -O psximager-2.2.4.tar.gz https://github.com/Ripper55555/psximager/archive/refs/tags/v2.2.4.tar.gz
-     tar -xf psximager-2.2.4.tar.gz
+     wget -O psximager-2.2.5.tar.gz https://github.com/Ripper55555/psximager/archive/refs/tags/v2.2.5.tar.gz
+     tar -xf psximager-2.2.5.tar.gz
 
   7. We need to recompile and install a modified libcdio.
 
      wget -c https://ftp.gnu.org/gnu/libcdio/libcdio-2.1.0.tar.bz2
      tar -xf libcdio-2.1.0.tar.bz2
-     cp -R psximager-2.2.4/src/libcdio-2.1.0/* libcdio-2.1.0/
+     cp -R psximager-2.2.5/src/libcdio-2.1.0/* libcdio-2.1.0/
 
      cd libcdio-2.1.0
      ./configure MAKE=make
@@ -65,7 +65,7 @@ You can build PSXImager for Windows using the MSYS2 environment.
 
   8. Run build commands:
 
-     cd psximager-2.2.4/
+     cd psximager-2.2.5/
 
      ./bootstrap
      ./configure --host=i686-w64-mingw32 LDFLAGS="-s -static"

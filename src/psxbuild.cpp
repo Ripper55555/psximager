@@ -51,16 +51,16 @@ using namespace std;
 
 #define TOOL_VERSION "PSXBuild v2.2.5 (Win32 build by ^Ripper)"
 #ifdef _WIN32
-    #define timegm _mkgmtime
+	#define timegm _mkgmtime
 #endif
 
 struct FileNode;
 struct DirNode;
 struct CueTrackInfo {
-    std::string filename;
-    int trackNumber = 0;
-    std::string trackType;  // "MODE2/2352" or "AUDIO"
-    int pregapSectors = 0;  // Calculated pregap in sectors
+	std::string filename;
+	int trackNumber = 0;
+	std::string trackType;  // "MODE2/2352" or "AUDIO"
+	int pregapSectors = 0;  // Calculated pregap in sectors
 };
 
 int audioSectors = 0;
@@ -108,201 +108,195 @@ std::string base64_decode(const std::string& encodedContent) {
 
 // Simple .cue parser.
 std::vector<CueTrackInfo> parseCueFile(const std::string& cueContent) {
-    std::vector<CueTrackInfo> tracks;
-    std::istringstream cueStream(cueContent);
-    std::string line;
-    CueTrackInfo currentTrack;
-    std::string currentFilename;
-    int index00Sector = -1; // Initialize to -1 to indicate no pregap by default
+	std::vector<CueTrackInfo> tracks;
+	std::istringstream cueStream(cueContent);
+	std::string line;
+	CueTrackInfo currentTrack;
+	std::string currentFilename;
+	int index00Sector = -1; // Initialize to -1 to indicate no pregap by default
 
-    std::regex fileRegex(R"(FILE \"([^\"]+)\" BINARY)");
-    std::regex trackRegex(R"(TRACK (\d+) (MODE2/2352|AUDIO))");
-    std::regex indexRegex(R"(INDEX (\d{2}) (\d{2}):(\d{2}):(\d{2}))");
+	std::regex fileRegex(R"(FILE \"([^\"]+)\" BINARY)");
+	std::regex trackRegex(R"(TRACK (\d+) (MODE2/2352|AUDIO))");
+	std::regex indexRegex(R"(INDEX (\d{2}) (\d{2}):(\d{2}):(\d{2}))");
+	std::regex pregapRegex(R"(PREGAP (\d{2}):(\d{2}):(\d{2}))");
 
-    while (std::getline(cueStream, line)) {
-        std::smatch match;
+	while (std::getline(cueStream, line)) {
+		std::smatch match;
 
-        if (std::regex_search(line, match, fileRegex)) {
-            // Capture the filename for the current set of tracks
-            currentFilename = match[1];
-        } else if (std::regex_search(line, match, trackRegex)) {
-            // Store the last track info before moving to the next track
-            if (currentTrack.trackNumber != 0) {
-                tracks.push_back(currentTrack);
-            }
+		if (std::regex_search(line, match, fileRegex)) {
+			// Capture the filename for the current set of tracks
+			currentFilename = match[1];
+		} else if (std::regex_search(line, match, trackRegex)) {
+			if (currentFilename.empty()) {
+				throw std::runtime_error("CUE file format error: missing filename before TRACK definition.");
+			}
+			// Store the last track info before moving to the next track
+			if (currentTrack.trackNumber != 0) {
+				tracks.push_back(currentTrack);
+				currentTrack = CueTrackInfo();  // Reset the track object to default values
+			}
 
-            // Initialize a new track with the current filename
-            currentTrack.filename = currentFilename;
-            currentTrack.trackNumber = std::stoi(match[1]);
-            currentTrack.trackType = match[2];
-            currentTrack.pregapSectors = 0;  // Default to 0 pregap
-            index00Sector = -1; // Reset for new track
-        } else if (std::regex_search(line, match, indexRegex)) {
-            int indexNum = std::stoi(match[1]);
-            int minutes = std::stoi(match[2]);
-            int seconds = std::stoi(match[3]);
-            int frames = std::stoi(match[4]);
+			// Initialize a new track with the current filename
+			currentTrack.filename = currentFilename;
+			currentTrack.trackNumber = std::stoi(match[1]);
+			currentTrack.trackType = match[2];
+			currentTrack.pregapSectors = -1;  // Default to -1 to indicate no pregap explicitly set
+			index00Sector = -1; // Reset for new track
+		} else if (std::regex_search(line, match, pregapRegex)) {
+			// Parse PREGAP line and convert to sectors
+			int minutes = std::stoi(match[1]);
+			int seconds = std::stoi(match[2]);
+			int frames = std::stoi(match[3]);
+			currentTrack.pregapSectors = (minutes * 60 + seconds) * 75 + frames;
+		} else if (std::regex_search(line, match, indexRegex)) {
+			int indexNum = std::stoi(match[1]);
+			int minutes = std::stoi(match[2]);
+			int seconds = std::stoi(match[3]);
+			int frames = std::stoi(match[4]);
 
-            int sector = (minutes * 60 + seconds) * 75 + frames;
+			int sector = (minutes * 60 + seconds) * 75 + frames;
 
-            // Store INDEX 00 sector for pregap calculation
-            if (indexNum == 0) {
-                index00Sector = sector;
-            } else if (indexNum == 1) {
-                // Calculate pregap as the difference between INDEX 00 and INDEX 01
-                currentTrack.pregapSectors = (index00Sector != -1) ? sector - index00Sector : 0;
-            }
-        }
-    }
+			// Store INDEX 00 sector for pregap calculation
+			if (indexNum == 0) {
+				index00Sector = sector;
+			} else if (indexNum == 1) {
+				// Calculate pregap as the difference between INDEX 00 and INDEX 01, unless already set by PREGAP
+				if (currentTrack.pregapSectors == -1 && index00Sector != -1) {
+					currentTrack.pregapSectors = sector - index00Sector;
+				}
+			}
+		}
+	}
 
-    // Add the last track if available
-    if (currentTrack.trackNumber != 0) {
-        tracks.push_back(currentTrack);
-    }
+	// Add the last track if available
+	if (currentTrack.trackNumber != 0) {
+		tracks.push_back(currentTrack);
+	}
 
-    return tracks;
-}
-
-std::vector<char> stripWavHeader(const std::filesystem::path& wavFile) {
-    std::ifstream wavStream(wavFile, std::ios::binary);
-    if (!wavStream) {
-        throw std::runtime_error("Could not open WAV file: " + wavFile.string());
-    }
-
-    // Check the RIFF header
-    char riffHeader[4];
-    wavStream.read(riffHeader, 4);
-    if (std::strncmp(riffHeader, "RIFF", 4) != 0) {
-        throw std::runtime_error("Invalid WAV file (missing 'RIFF'): " + wavFile.string());
-    }
-
-    // Skip over RIFF chunk size (4 bytes) and check WAVE format (4 bytes)
-    wavStream.seekg(4, std::ios::cur);
-    char waveHeader[4];
-    wavStream.read(waveHeader, 4);
-    if (std::strncmp(waveHeader, "WAVE", 4) != 0) {
-        throw std::runtime_error("Invalid WAV file (missing 'WAVE'): " + wavFile.string());
-    }
-
-    // Locate the "data" chunk
-    char chunkHeader[4];
-    uint32_t chunkSize;
-    bool dataChunkFound = false;
-
-    while (wavStream.read(chunkHeader, 4)) {
-        wavStream.read(reinterpret_cast<char*>(&chunkSize), sizeof(chunkSize));
-
-        // Convert chunk size from little endian to system endianness if needed
-        chunkSize = static_cast<uint32_t>(chunkSize);
-
-        if (std::strncmp(chunkHeader, "data", 4) == 0) {
-            dataChunkFound = true;
-            break;
-        }
-
-        // Skip the current chunk data to continue looking for the "data" chunk
-        wavStream.seekg(chunkSize, std::ios::cur);
-    }
-
-    if (!dataChunkFound) {
-        throw std::runtime_error("Invalid WAV file (missing 'data' chunk): " + wavFile.string());
-    }
-
-    // Now we're positioned at the start of the audio data
-    std::vector<char> rawData((std::istreambuf_iterator<char>(wavStream)), std::istreambuf_iterator<char>());
-    wavStream.close();
-    return rawData;
+	return tracks;
 }
 
 void writeBinWithPregap(std::vector<CueTrackInfo>& tracks, const std::filesystem::path& inputPath, const std::filesystem::path& outputPath) {
-    // Extract the directory and filename (without extension) from inputPath / outputPath
-    std::filesystem::path inputDir = inputPath.parent_path();
-    std::string baseNameWav = inputPath.stem().string();
-    std::filesystem::path outputDir = outputPath.parent_path();
-    std::string baseNameBin = outputPath.stem().string();
+	// Extract the directory and filename (without extension) from inputPath / outputPath
+	std::filesystem::path inputDir = inputPath.parent_path();
+	std::string baseNameWav = inputPath.stem().string();
+	std::filesystem::path outputDir = outputPath.parent_path();
+	std::string baseNameBin = outputPath.stem().string();
 
-    for (auto& track : tracks) {  // Use auto& to modify each track directly
-        // Process only AUDIO tracks
-        if (track.trackType == "AUDIO") {
-            // Generate the new WAV filename
-            std::string wavFileName = baseNameWav + "/" + "Track_" + (track.trackNumber < 10 ? "0" : "") + std::to_string(track.trackNumber) + ".wav";
-            std::filesystem::path fullPathWav = inputDir / wavFileName;
+	for (auto& track : tracks) {  // Use auto& to modify each track directly
+		// Process only AUDIO tracks
+		if (track.trackType == "AUDIO") {
+			// Generate the new WAV filename using std::format
+			std::string wavFileName = std::format("{}/Track_{:02}.wav", baseNameWav, track.trackNumber);
+			std::filesystem::path fullPathWav = inputDir / wavFileName;
 
-            // Create the .bin filename in the format "outputname_trackXX.bin" where XX is the track number
-            std::string binFileName = baseNameBin + "_track" + (track.trackNumber < 10 ? "0" : "") + std::to_string(track.trackNumber) + ".bin";
-            std::filesystem::path fullPathBin = outputDir / binFileName;
+			// Create the .bin filename in the format "outputname_trackXX.bin" using std::format
+			std::string binFileName = std::format("{}_track{:02}.bin", baseNameBin, track.trackNumber);
+			std::filesystem::path fullPathBin = outputDir / binFileName;
 
-            // Update the filename in CueTrackInfo
-            track.filename = binFileName;
+			// Update the filename in CueTrackInfo
+			track.filename = binFileName;
 
-            // Open the .bin file for writing
-            std::ofstream binFile(fullPathBin, std::ios::binary | std::ios::out | std::ios::trunc);
-            if (!binFile) {
-                throw std::runtime_error("Error creating bin file: " + fullPathBin.string());
-            }
+			// Open the .bin file for writing
+			std::ofstream binFile(fullPathBin, std::ios::binary | std::ios::out | std::ios::trunc);
+			if (!binFile) {
+				throw std::runtime_error("Error creating bin file: " + fullPathBin.string());
+			}
 
-            // Write pregap (150 sectors of silence if applicable)
-            if (track.pregapSectors > 0) {
-                std::vector<char> silence(2352, 0);
-                for (int i = 0; i < track.pregapSectors; ++i) {
-                    binFile.write(silence.data(), silence.size());
-                }
-            }
+			// Write pregap (150 sectors of silence if applicable)
+			if (track.pregapSectors > 0) {
+				std::vector<char> silence(2352 * track.pregapSectors, 0);
+				binFile.write(silence.data(), silence.size());
+			}
 
-            // Write the audio data from the updated filename
-            std::vector<char> audioData = stripWavHeader(fullPathWav);
-            binFile.write(audioData.data(), audioData.size());
+			// Stream the audio data from the WAV file instead of loading it all into memory
+			std::ifstream wavFile(fullPathWav, std::ios::binary);
+			if (!wavFile) {
+				throw std::runtime_error("Error opening WAV file: " + fullPathWav.string());
+			}
 
-            binFile.close();
+			// Locate the "data" chunk after the RIFF header
+			wavFile.seekg(12);  // Skip RIFF, Chunk Size, and WAVE headers (4 + 4 + 4 bytes)
+			char chunkHeader[4];
+			uint32_t chunkSize;
+			bool dataChunkFound = false;
 
-        } else {
-            track.filename = outputPath.string();
-        }
-    }
+			while (wavFile.read(chunkHeader, 4)) {
+				wavFile.read(reinterpret_cast<char*>(&chunkSize), sizeof(chunkSize));
+
+				if (std::strncmp(chunkHeader, "data", 4) == 0) {
+					dataChunkFound = true;
+					break;
+				}
+
+				wavFile.seekg(chunkSize, std::ios::cur);
+			}
+
+			if (!dataChunkFound) {
+				throw std::runtime_error("Invalid WAV file (missing 'data' chunk): " + fullPathWav.string());
+			}
+
+			// Stream audio data in chunks to avoid high memory usage
+			std::vector<char> buffer(4096);
+			while (wavFile.read(buffer.data(), buffer.size()) || wavFile.gcount() > 0) {
+				binFile.write(buffer.data(), wavFile.gcount());
+			}
+
+			binFile.close();
+
+		} else {
+			// Data track
+			track.filename = outputPath.string();
+		}
+	}
 }
 
-void writeCueFile2(const std::vector<CueTrackInfo>& tracks, const std::filesystem::path& outputPath) {
-    // Create the .cue filename based on outputPath's stem (filename without extension) and add ".cue"
-    std::filesystem::path cueFileName = outputPath.parent_path() / (outputPath.stem().string() + ".cue");
+// Function to write .cue file
+void writeRebuildCueFile(const std::vector<CueTrackInfo>& tracks, const std::filesystem::path& outputPath) {
+	// Create the .cue filename based on outputPath's stem (filename without extension) and add ".cue"
+	std::filesystem::path cueFileName = outputPath.parent_path() / (outputPath.stem().string() + ".cue");
 
-    // Open the .cue file for writing
-    std::ofstream cueFile(cueFileName, std::ios::out | std::ios::trunc);
-    if (!cueFile) {
-        throw std::runtime_error("Error creating cue file: " + cueFileName.string());
-    }
+	// Open the .cue file for writing
+	std::ofstream cueFile(cueFileName, std::ios::out | std::ios::trunc);
+	if (!cueFile) {
+		throw std::runtime_error("Error creating cue file: " + cueFileName.string());
+	}
 
-    // Write each track's information to the .cue file
-    for (const auto& track : tracks) {
-        // Write the FILE line
-        cueFile << "FILE \"" << track.filename << "\" BINARY\n";
+	// Write each track's information to the .cue file
+	for (const auto& track : tracks) {
+		// Write the FILE line
+		cueFile << "FILE \"" << track.filename << "\" BINARY\n";
 
-        // Write the TRACK line with track number and type (e.g., AUDIO or MODE2/2352)
-        cueFile << "  TRACK " << (track.trackNumber < 10 ? "0" : "") << track.trackNumber << " " << track.trackType << "\n";
+		// Write the TRACK line with track number and type (e.g., AUDIO or MODE2/2352)
+		cueFile << "  TRACK " << (track.trackNumber < 10 ? "0" : "") << track.trackNumber << " " << track.trackType << "\n";
 
-        // If it's an AUDIO track with a pregap, write INDEX 00 and INDEX 01 with pregap time
-        if (track.trackType == "AUDIO" && track.pregapSectors > 0) {
-            // Calculate INDEX 01 time from pregapSectors
-            int totalSeconds = track.pregapSectors / 75;
-            int frames = track.pregapSectors % 75;
-            int minutes = totalSeconds / 60;
-            int seconds = totalSeconds % 60;
+		// If it's an AUDIO track with an explicitly set pregap, write INDEX 00 and INDEX 01 with pregap time
+		if (track.trackType == "AUDIO" && track.pregapSectors > 0) {
+			// Calculate INDEX 01 time from pregapSectors
+			int totalSeconds = track.pregapSectors / 75;
+			int frames = track.pregapSectors % 75;
+			int minutes = totalSeconds / 60;
+			int seconds = totalSeconds % 60;
 
-            // Write INDEX 00 at 00:00:00
-            cueFile << "    INDEX 00 00:00:00\n";
-            // Write INDEX 01 with the calculated pregap time
-            cueFile << "    INDEX 01 "
-                    << std::setw(2) << std::setfill('0') << minutes << ":"
-                    << std::setw(2) << std::setfill('0') << seconds << ":"
-                    << std::setw(2) << std::setfill('0') << frames << "\n";
-        } else {
-            // Default INDEX 01 at 00:00:00 for non-AUDIO tracks or tracks without pregap
-            cueFile << "    INDEX 01 00:00:00\n";
-        }
-    }
+			// Write INDEX 00 at 00:00:00
+			cueFile << "	INDEX 00 00:00:00\n";
+			// Write INDEX 01 with the calculated pregap time
+			cueFile << "	INDEX 01 "
+					<< std::setw(2) << std::setfill('0') << minutes << ":"
+					<< std::setw(2) << std::setfill('0') << seconds << ":"
+					<< std::setw(2) << std::setfill('0') << frames << "\n";
+		} else if (track.pregapSectors == -1) {
+			// No pregap explicitly defined in input, only write INDEX 01
+			cueFile << "	INDEX 01 00:00:00\n";
+		} else {
+			// Default INDEX 01 at 00:00:00 for non-AUDIO tracks or tracks without pregap
+			cueFile << "	INDEX 01 00:00:00\n";
+		}
+	}
 
-    cueFile.close();
+	cueFile.close();
 
-    std::cout << "Cue file written to " << cueFileName << std::endl;
+	std::cout << "Cue file written to " << cueFileName << std::endl;
 }
 
 // Check for .DA audio tracks.
@@ -1666,14 +1660,14 @@ int main(int argc, char ** argv)
 
 		cout << "Image file written to " << imageName << endl;
 
-    // Process audio tracks.
-    std::vector<CueTrackInfo> tracks = parseCueFile(original_cue_file);
+		// Process stored .cue file.
+		std::vector<CueTrackInfo> tracks = parseCueFile(original_cue_file);
 
-    // Parse tracks and convert WAV to BIN with pregap
-    writeBinWithPregap(tracks, inputPath, outputPath);
+		// Process stored .wav files.
+		writeBinWithPregap(tracks, inputPath, outputPath);
 
-		// Write the cue file
-    writeCueFile2(tracks, outputPath);
+		// Write the .cue file
+		writeRebuildCueFile(tracks, outputPath);
 
 		cdio_info("Done.");
 
