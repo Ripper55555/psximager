@@ -722,20 +722,25 @@ int main(int argc, const char ** argv)
 			track_format_t format = cdio_get_track_format(image, track);
 
 			// Get the start and end sector of the track
-			lsn_t pregap_sector = cdio_get_track_pregap_lba(image, track);         // Pregap size
-			pregap_sector = (pregap_sector < 0 && track == 1 ? 0 : pregap_sector); // Track 1 always has a negative bogus number for pregap
-			lsn_t start_sector = cdio_get_track_lba(image, track);                 // The actual start before pregap
-			lsn_t data_sector = start_sector + pregap_sector;                      // After pregap where the actual data is
-			lsn_t end_sector = cdio_get_track_last_lsn(image, track);              // Last sector
-			lsn_t total_sector = cdio_get_track_sec_count(image, track);           // Total sector amount
+			lsn_t pregap_sector = cdio_get_track_pregap_lba(image, track);  // Pregap size
+			pregap_sector = (pregap_sector < 0 ? 0 : pregap_sector);        // Correct pregap if it has a bogus negative number.
+			lsn_t start_sector = cdio_get_track_lba(image, track);          // The actual start before pregap
+			lsn_t data_sector = start_sector + pregap_sector;               // After pregap where the actual data is
+			lsn_t end_sector = cdio_get_track_last_lsn(image, track);       // Last sector
+			lsn_t total_sector = cdio_get_track_sec_count(image, track);    // Total sector amount
 
-			if (track == last_track) {           // Issue with the last track. Always +150 sectors. The faked lead out?
-				total_sector = total_sector - 150; // When there is only a data track, then this also counts as "last track".
+			// Issue with the last track. Always +150 sectors. The faked lead out?
+			// When there is only a data track, then this also counts as "last track".
+			if (track == last_track) {
+				total_sector = total_sector - 150;
 			}
 
-			if (discMode == 3 && track != last_track) { // Disc mode (Mixed mode) issue.
-				end_sector = end_sector + 150;            // cdio_get_track_last_lsn() under reports by 150 sectors all but the last track.
-			}                                           // This does not happen in XA mode when you strip the audio from the .cue file.
+			// Disc mode (Mixed mode) issue.
+			// cdio_get_track_last_lsn() under reports by 150 sectors all but the last track.
+			// This does not happen in XA mode when you strip the audio from the .cue file.
+			if (discMode == 3 && track != last_track) {
+				end_sector = end_sector + 150;
+			}
 
 			if (track == 1) {
 				last_lsnTrack1 = end_sector;
