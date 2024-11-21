@@ -676,6 +676,8 @@ int main(int argc, const char ** argv)
 		// Open the input image (Force .cue extension on input argument! Libcdio will moan otherwise.)
 		inputPath.replace_extension(".cue");
 
+		cout << "Analyzing image " << inputPath << "...\n";
+
 		if (fs::exists(inputPath)) {
 			// Open the cue file and encode in base64 string.
 			std::ifstream file(inputPath, std::ios::in | std::ios::binary | std::ios::ate);
@@ -703,8 +705,6 @@ int main(int argc, const char ** argv)
 		if (image == NULL) {
 			throw runtime_error(format("Error opening input image {}, or image has wrong type", inputPath.string()));
 		}
-
-		cout << "Analyzing image " << inputPath << "...\n";
 
 		// Get the TOC (Table of Contents) of the CD
 		track_t first_track = cdio_get_first_track_num(image);
