@@ -93,11 +93,11 @@ static bool parse_cuefile(_img_private_t *cd, const char *toc_name);
 
 unsigned long get_file_size(const char *filename);
 unsigned long get_file_size(const char *filename) {
-    // Use Windows API to get the file size
+    /* Use Windows API to get the file size */
     DWORD fileSize;
     HANDLE hFile = CreateFile(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        return 0;  // If the file cannot be opened
+        return 0;
     }
 
     fileSize = GetFileSize(hFile, NULL);
@@ -112,21 +112,21 @@ unsigned long get_file_size(const char *filename) {
     if (stat(filename, &st) == 0) {
         return st.st_size;
     }
-    return 0;  // Return 0 if the file size could not be determined
+    return 0;
 }
 #endif
 
-// Function to get the sector count from the bin file, accounting for pregap
+/* Function to get the sector count from the bin file, accounting for pregap */
 static unsigned long get_track_sector_count(const char *filename, int sector_size, int pregap_sectors) {
     unsigned long file_size = get_file_size(filename);
     if (file_size > 0) {
-        unsigned long total_sectors = file_size / sector_size;  // Divide by sector size (e.g., 2352)
+        unsigned long total_sectors = file_size / sector_size;
         if (pregap_sectors > 0) {
             total_sectors -= pregap_sectors;  // Subtract pregap sectors if necessary
         }
         return total_sectors;
     }
-    return 0;  // If file size couldn't be determined
+    return 0;
 }
 
 /*!
@@ -160,13 +160,16 @@ _init_bincue(_img_private_t *p_env)
   }
 
   lead_lsn = get_disc_last_lsn_bincue( (_img_private_t *) p_env);
+  cdio_log(CDIO_LOG_INFO, "Last disc LSN %d", lead_lsn);
 
   if (-1 == lead_lsn) return false;
 
   if (NULL == p_env->psz_cue_name) return false;
 
 
-  /* Fake out leadout track and sector count for last track*/
+  /* Fake out leadout track and sector count for last track
+     Save the calculated sector count of the last track for undoing later. */
+  p_env->tocent[p_env->gen.i_tracks - p_env->gen.i_first_track].sec_count_last_Track = p_env->tocent[p_env->gen.i_tracks - p_env->gen.i_first_track].sec_count;
   cdio_lsn_to_msf (lead_lsn, &p_env->tocent[p_env->gen.i_tracks].start_msf);
   p_env->tocent[p_env->gen.i_tracks].start_lba = cdio_lsn_to_lba(lead_lsn);
   p_env->tocent[p_env->gen.i_tracks - p_env->gen.i_first_track].sec_count =
@@ -289,9 +292,13 @@ static lsn_t get_disc_last_lsn_bincue(void *p_user_data) {
         // Get the filename for the current track
         const char *filename = p_env->tocent[track - p_env->gen.i_first_track].filename;
         int sector_size = CDIO_CD_FRAMESIZE_RAW;  // Default sector size
+        int silence = p_env->tocent[track - p_env->gen.i_first_track].silence;
 
         // Calculate the number of sectors in this track
         track_sectors = get_track_sector_count(filename, sector_size, 0);
+        if (filename != NULL) {
+          track_sectors += silence;
+        }
 
         if (track_sectors == 0) {
             // cdio_warn("Failed to determine sector count for file: %s", filename);
@@ -300,7 +307,7 @@ static lsn_t get_disc_last_lsn_bincue(void *p_user_data) {
 
         total_sectors += track_sectors;
     }
-
+    
     return total_sectors;
 }
 
@@ -322,6 +329,17 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
   /* The below declarations may be unique to this image-parse routine. */
   int start_index;
   bool b_first_index_for_track=false;
+  
+  // Sector count for track 1
+  lba_t totalSectorCount = 0;
+
+  // For displaying the last tracklog
+  int index_01_count = 0;
+  int index_01_processed = 0;
+  
+  // For index00 logging
+  msf_t prevIndex00;
+  msf_t thisIndex00;
 
   if (NULL == psz_cue_name)
     return false;
@@ -343,6 +361,14 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
     cd->gen.i_first_track=1;
     cd->psz_mcn=NULL;
   }
+
+  /* Pre-count "INDEX 01" occurrences (tracks) */
+  while (fgets(psz_line, MAXLINE, fp) != NULL) {
+    if (strstr(psz_line, "INDEX 01") != NULL) {
+      index_01_count++;
+    }
+  }
+  rewind(fp);
 
   while ((fgets(psz_line, MAXLINE, fp)) != NULL) {
 
@@ -760,7 +786,9 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
       } else if (0 == strcmp("PREGAP", psz_keyword)) {
         if (0 <= i) {
           if (NULL != (psz_field = strtok(NULL, " \t\n\r"))) {
-            lba_t lba = cdio_mmssff_to_lba (psz_field); // Removed the cdio_lsn_to_lba() encapsulation as it always adds 150 pregap sectors which is wrong.
+            /* Removed the cdio_lsn_to_lba() encapsulation as it always adds 150 pregap sectors
+               on top of the calculated 150 sectors from 00:02:00 which is wrong. */
+            lba_t lba = cdio_mmssff_to_lba (psz_field);
             if (CDIO_INVALID_LBA == lba) {
               cdio_log(log_level, "%s line %d: after word PREGAP:",
                        psz_cue_name, i_line);
@@ -806,7 +834,6 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
 #ifdef FIXME
               cd->tocent[i].indexes[cd->tocent[i].nindex++] = lba;
 #else
-              // PSX data track has no pregap but an implied postgap of 150 sectors.
               track_info_t *this_track = &(cd->tocent[cd->gen.i_tracks - 1]);
               track_info_t *prev_track = &(cd->tocent[cd->gen.i_tracks - 2]);
               const char *track_filename = cd->tocent[cd->gen.i_tracks - 1].filename;
@@ -820,82 +847,134 @@ parse_cuefile (_img_private_t *cd, const char *psz_cue_name)
 
               case 1:
 
+                index_01_processed++;
+                
                 if (!b_first_index_for_track) {
                   cdio_lba_to_msf(lba, &(this_track->start_msf));
                   b_first_index_for_track = true;
                   this_track->start_lba   = lba;
                 }
+                
+                if (cd->gen.i_tracks == 2) {
+                  this_track->silence = 150;
+                }
 
+                /* [Lead in]          Lead in, or pregap of track 1.
+
+                   [Track 1]
+                     [Track 1 Data  ]
+                     [Postgap       ] PlayStation-required, appended to data track.
+
+                   [Silence]          Mandatory fixed 150 sectors (2 seconds) between tracks.
+
+                   [Track 2]          Audio track.
+                     [INDEX00 Pregap] Optional, but usually 150 sectors (2 seconds) and is a part of the audio track.
+                     [INDEX01 Audio ] Actual Audio Data.
+
+                   [Silence]          Optional fixed 150 sectors (2 seconds) between tracks.
+
+                   [Track 3+]         Audio track.
+                     [INDEX00 Pregap] Optional, but usually 150 sectors (2 seconds) and is a part of the audio track.
+                     [INDEX01 Audio ] Actual Audio Data.
+
+                   [Lead out]         Lead out 150 sectors, faked by libcdio as it is not written in the image.
+
+                   Note1: PSX data track has no pregap but an implied postgap of 150 sectors.
+                   Note2: start_lba is where the data starts. NOT the beginning of the track! It refers to INDEX 01.
+                   Note3: All the MSF times in a .cue file are compensated minus 00:02:00
+                          This because the .bin file lacks the 150 pregap sectors of track 1.
+                          So real disc sector 00:02:00 / LBA 0 is mapped in INDEX 01 as 00:00:00 / LBA 0 for the .bin file.
+                          The actual LBA of the pregap starts at -150.
+                          Calculating the sector offset in the .bin file is LBA = (Minutes × 60 × 75) + (Seconds × 75) + Frames */
+                
                 if (b_first_index_for_track && cd->gen.i_tracks > 1 && track_filename == NULL) {
-                  // Process if cue file has only 1 bin file with multiple tracks.
-                  // Tracks 2+ filename would be NULL in that case.
-                  // Example:
-                  //
-                  // FILE "ABC.BIN" BINARY
-                  //   TRACK 01 MODE1/2352
-                  //     INDEX 01 00:00:00
-                  //   TRACK 02 AUDIO
-                  //     PREGAP 00:02:00
-                  //     INDEX 01 22:16:11
-                  //   TRACK...
+                  /* Process if cue file has only 1 bin file with multiple tracks.
+                     Tracks 2+ filename would be NULL in that case.
+                     Example:
 
-                  cdio_lba_to_msf(lba, &(this_track->start_msf));
+                     FILE "ABC.BIN" BINARY
+                       TRACK 01 MODE1/2352
+                         INDEX 01 00:00:00
+                       TRACK 02 AUDIO
+                         PREGAP 00:02:00
+                         INDEX 01 22:16:11
+                       TRACK... */
+
                   this_track->start_lba = lba;
+                  cdio_lba_to_msf(lba, &(this_track->start_msf));
                   
-                  // If exist pregap value from INDEX 00 then subtract it from LBA.
-                  // Not multifile, so no INDEX 00 00:00:00 as a start but usually
-                  // a number 150 sectors lower in value compared to startLBA.
+                  /* If exist pregap value from INDEX 00 then subtract it from LBA.
+                     Not multifile, so no INDEX 00 00:00:00 as a start but usually
+                     a number 150 sectors lower in value compared to startLBA. */
                   if (this_track->pregap > CDIO_PREGAP_SECTORS) {
-                    this_track->pregap = this_track->start_lba - this_track->pregap;
+                    this_track->pregap = this_track->start_lba - this_track->pregap; // Convert this into the difference between start of track and start of data (pregap)
                   }
-                  prev_track->sec_count = this_track->start_lba - prev_track->start_lba;
+                  this_track->sec_count = totalSectorCount - (this_track->start_lba - this_track->pregap); // Placeholder as they are replaced when the next track is processed. Used for the last track.
+                  
+                  prev_track->sec_count = (this_track->start_lba - this_track->pregap - this_track->silence) - (prev_track->start_lba - prev_track->pregap);
 
                 } else {
-                  // Process if cue file has multiple bin files and multiple tracks or just one track.
-                  // Example:
-                  //
-                  // FILE "ABC.BIN" BINARY
-                  //   TRACK 01 MODE1/2352
-                  //     INDEX 01 00:00:00
-                  // FILE "DEF.BIN" BINARY
-                  //   TRACK 02 AUDIO
-                  //     INDEX 00 00:00:00
-                  //     INDEX 01 00:02:00
-                  // FILE...
+                  /* Process if cue file has multiple bin files and multiple tracks or just one track.
+                     Example:
+
+                     FILE "ABC.BIN" BINARY
+                       TRACK 01 MODE1/2352
+                         INDEX 01 00:00:00
+                     FILE "DEF.BIN" BINARY
+                       TRACK 02 AUDIO
+                         INDEX 00 00:00:00
+                         INDEX 01 00:02:00
+                     FILE... */
 
                   this_track->pregap = lba;
 
-                  // Calculate the sector count for the current track based on file size.
-                  // Sector count is the data without pregap.
-                  this_track->sec_count = get_track_sector_count(track_filename, CDIO_CD_FRAMESIZE_RAW, this_track->pregap);
+                  /* Calculate the sector count for the current track based on file size.
+                     Sector count is all sectors, including pregap! */
+                  this_track->sec_count = get_track_sector_count(track_filename, CDIO_CD_FRAMESIZE_RAW, 0);
+                  if (cd->gen.i_tracks == 1) {
+                    
+                    totalSectorCount = this_track->sec_count;
+                  }
 
-                  // Cumulative LBA calculation
+                  // Cumulative LBA calculation. Reminder ->start_lba is index 01 after pregap.
                   if (cd->gen.i_tracks > 1) {
-                    lba = prev_track->start_lba + prev_track->pregap + prev_track->sec_count;
-                    cdio_lba_to_msf(lba, &(this_track->start_msf));
-                    this_track->start_lba = lba;      
+                    lba = (prev_track->start_lba - prev_track->pregap) + prev_track->sec_count;
+                    this_track->start_lba = lba + this_track->silence + this_track->pregap;      
+                    cdio_lba_to_msf(this_track->start_lba, &(this_track->start_msf));
                   }
                 }
 
-/*                cdio_log (CDIO_LOG_INFO, "Track %02d, File: %s, MSF: %8s, startLBA: %7d, startIndex: %d, Silence: %d, Pregap: %7d, Sectors: %7d\n",
+                // Track data logging
+                cdio_lba_to_msf(prev_track->start_lba - prev_track->pregap, &prevIndex00);
+                cdio_lba_to_msf(this_track->start_lba - this_track->pregap, &thisIndex00);
+
+                if (cd->gen.i_tracks - 1 > 0) {
+                  cdio_log (CDIO_LOG_INFO, "%-5d  %8s  %8s  %7d  %9d  %6d  %8d  %7d  %6d  %s", //  (Corrected)
                                       cd->gen.i_tracks - 1,
-                                      prev_track->filename,
+                                      cdio_msf_to_str(&prevIndex00),
                                       cdio_msf_to_str(&prev_track->start_msf),
-                                      prev_track->start_lba,
-                                      prev_track->start_index,
                                       prev_track->silence,
+                                      prev_track->start_lba - prev_track->pregap,
                                       prev_track->pregap,
-                                      prev_track->sec_count);
-*/
-                cdio_log (CDIO_LOG_INFO, "Track %02d, File: %s, MSF: %8s, startLBA: %7d, startIndex: %d, Silence: %d, Pregap: %7d, Sectors: %7d",
+                                      prev_track->start_lba,
+                                      (prev_track->start_lba - prev_track->pregap) + (prev_track->sec_count - 1),
+                                      prev_track->sec_count,
+                                      prev_track->filename);
+                }
+
+                if (index_01_processed == index_01_count) { // For the last entry (track)
+                  cdio_log (CDIO_LOG_INFO, "%-5d  %8s  %8s  %7d  %9d  %6d  %8d  %7d  %6d  %s", // (Uncorrected)
                                       cd->gen.i_tracks,
-                                      this_track->filename,
+                                      cdio_msf_to_str(&thisIndex00),
                                       cdio_msf_to_str(&this_track->start_msf),
-                                      this_track->start_lba,
-                                      this_track->start_index,
                                       this_track->silence,
+                                      this_track->start_lba - this_track->pregap,
                                       this_track->pregap,
-                                      this_track->sec_count);
+                                      this_track->start_lba,
+                                      (this_track->start_lba - this_track->pregap) + (this_track->sec_count - 1),
+                                      this_track->sec_count,
+                                      this_track->filename);
+                }
 
                 this_track->num_indices++;
                 break;
@@ -968,17 +1047,17 @@ _switch_data_source_if_needed(_img_private_t *p_env, lsn_t *lsn)
   int track;
   int lsnRequest = *lsn;
 
-  // Filename == NULL for tracks 2+ on a 1 file .bin / .cue combo.
-  // Just return true to prevent relative lsn processing and file reloading.
+  /* Filename == NULL for tracks 2+ on a 1 file .bin / .cue combo.
+     Just return true to prevent relative lsn processing and file reloading. */
   if (p_env->gen.i_tracks > p_env->gen.i_first_track && p_env->tocent[p_env->gen.i_first_track].filename == NULL) {
     return true;
   }
 
   /* Iterate over all tracks to find the correct file for the given LSN */
   for (track = p_env->gen.i_first_track; track <= p_env->gen.i_tracks; track++) {
-    lsn_t start_lba = p_env->tocent[track - p_env->gen.i_first_track].start_lba;
+    lsn_t start_lba = p_env->tocent[track - p_env->gen.i_first_track].start_lba - p_env->tocent[track - p_env->gen.i_first_track].pregap;
     lsn_t sec_count = p_env->tocent[track - p_env->gen.i_first_track].sec_count;
-    lsn_t end_lba = start_lba + sec_count + p_env->tocent[track - p_env->gen.i_first_track].pregap - 1;
+    lsn_t end_lba = start_lba + (sec_count - 1);
 
     /* Check if the given LSN falls within this track's LBA range */
     if (*lsn >= start_lba && *lsn <= end_lba) {
@@ -1005,7 +1084,7 @@ _switch_data_source_if_needed(_img_private_t *p_env, lsn_t *lsn)
       
       /* Successfully switched the data source; adjust LSN for the file's offset */
       *lsn -= start_lba;  // Adjust LSN to be relative to the track start
-      cdio_log(CDIO_LOG_INFO, "Switched to file %s for LSN %d. Track file offset LSN %d", p_env->gen.source_name, lsnRequest, *lsn);
+      cdio_log(CDIO_LOG_DEBUG, "Switched to file %s for LSN %d. Track file offset LSN %d", p_env->gen.source_name, lsnRequest, *lsn);
       return true;
     }
   }
@@ -1263,7 +1342,7 @@ static track_format_t
 _get_track_format_bincue(void *p_user_data, track_t i_track)
 {
   const _img_private_t *p_env = p_user_data;
-
+  
   if (!p_env->gen.init) return TRACK_FORMAT_ERROR;
 
   if (i_track > p_env->gen.i_first_track + p_env->gen.i_tracks - 1
@@ -1271,6 +1350,23 @@ _get_track_format_bincue(void *p_user_data, track_t i_track)
     return TRACK_FORMAT_ERROR;
 
   return p_env->tocent[i_track-p_env->gen.i_first_track].track_format;
+}
+
+/*!
+  Return the track sector format or "mode".
+*/
+static trackmode_t
+_get_track_mode_bincue(void *p_user_data, track_t i_track)
+{
+  const _img_private_t *p_env = p_user_data;
+
+  if (!p_env->gen.init) return TRACK_FORMAT_ERROR;
+
+  if (i_track > p_env->gen.i_first_track + p_env->gen.i_tracks - 1
+      || i_track < p_env->gen.i_first_track)
+    return TRACK_FORMAT_ERROR;
+
+  return p_env->tocent[i_track-p_env->gen.i_first_track].mode;
 }
 
 /*!
@@ -1312,6 +1408,25 @@ _get_lba_track_bincue(void *p_user_data, track_t i_track)
   if (i_track <= p_env->gen.i_tracks + p_env->gen.i_first_track
       && i_track >= p_env->gen.i_first_track) {
     return p_env->tocent[i_track-p_env->gen.i_first_track].start_lba;
+  } else
+    return CDIO_INVALID_LBA;
+}
+
+/*
+  Return the track sector count from the .cue parsed data.
+  It will undo the pasted on leadout of the last track with the stored original value.
+*/
+static lba_t get_track_end_lba_bincue(void *p_user_data, track_t i_track) {
+  _img_private_t *p_env = p_user_data;
+  
+  if (i_track <= p_env->gen.i_tracks + p_env->gen.i_first_track && i_track >= p_env->gen.i_first_track) {
+    if (i_track == (p_env->gen.i_first_track + p_env->gen.i_tracks - 1) && p_env->tocent[p_env->gen.i_tracks - p_env->gen.i_first_track].sec_count_last_Track > 0) {
+      return (p_env->tocent[i_track-p_env->gen.i_first_track].start_lba - p_env->tocent[i_track-p_env->gen.i_first_track].pregap) + 
+             (p_env->tocent[i_track-p_env->gen.i_first_track].sec_count_last_Track - 1);
+    } else {
+      return (p_env->tocent[i_track-p_env->gen.i_first_track].start_lba - p_env->tocent[i_track-p_env->gen.i_first_track].pregap) + 
+             (p_env->tocent[i_track-p_env->gen.i_first_track].sec_count - 1);
+    }
   } else
     return CDIO_INVALID_LBA;
 }
@@ -1450,8 +1565,10 @@ cdio_open_cue (const char *psz_cue_name)
   _funcs.get_track_channels    = get_track_channels_image;
   _funcs.get_track_copy_permit = get_track_copy_permit_image;
   _funcs.get_track_format      = _get_track_format_bincue;
+  _funcs.get_track_mode        = _get_track_mode_bincue;
   _funcs.get_track_green       = _get_track_green_bincue;
   _funcs.get_track_lba         = _get_lba_track_bincue;
+  _funcs.get_track_end_lba     = get_track_end_lba_bincue;
   _funcs.get_track_msf         = _get_track_msf_image;
   _funcs.get_track_preemphasis = get_track_preemphasis_image;
   _funcs.get_track_pregap_lba  = get_track_pregap_lba_image;

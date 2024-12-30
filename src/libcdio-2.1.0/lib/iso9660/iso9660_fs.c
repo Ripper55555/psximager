@@ -801,9 +801,9 @@ _iso9660_dir_to_statbuf (iso9660_dir_t *p_iso9660_dir, bool_3way_t b_xa,
   p_stat->y2kbug  = (p_iso9660_dir->recording_time.dt_year < 70);
   p_stat->timezone= (int16_t)p_iso9660_dir->recording_time.dt_gmtoff;
   p_stat->hidden  = (p_iso9660_dir->file_flags & ISO_EXISTENCE)
-   ? _STAT_HIDDEN : _STAT_VISIBLE;
+    ? _STAT_HIDDEN : _STAT_VISIBLE;
   p_stat->type    = (p_iso9660_dir->file_flags & ISO_DIRECTORY)
-   ? _STAT_DIR : _STAT_FILE;
+    ? _STAT_DIR : _STAT_FILE;
   p_stat->lsn     = from_733 (p_iso9660_dir->extent);
   p_stat->size    = from_733 (p_iso9660_dir->size);
   p_stat->secsize = _cdio_len2blocks (p_stat->size, ISO_BLOCKSIZE);

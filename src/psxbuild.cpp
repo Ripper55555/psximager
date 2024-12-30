@@ -49,34 +49,43 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXBuild v2.2.5 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXBuild v2.2.6 (Win32 build by ^Ripper)"
+
 #ifdef _WIN32
 	#define timegm _mkgmtime
 #endif
 
 struct FileNode;
 struct DirNode;
-struct CueTrackInfo {
-	std::string filename;
-	int trackNumber = 0;
-	std::string trackType;  // "MODE2/2352" or "AUDIO"
-	int pregapSectors = 0;  // Calculated pregap in sectors
+struct TrackInfo {
+	int trackNumber;
+	std::string trackType;
+	int startSector;
+	int pregapSectors;
+	int dataOffset;
+	int endSector;
+	int totalSectors;
 };
 
 int audioSectors = 0;
+int strictRebuild = 0;
 int track1SectorCount = 0;
 int track1SectorCountOffset = 0;
-int track1PostgapSectors = 0;
 int track1PostgapType = 0;
 int timeZone = 0;
 int y2kbug = 0;
-std::string original_cue_file = "";
 
+std::string track_listing = "";
+std::vector<TrackInfo> tracks;
+
+fs::path psxripDir;
+  
 // Mode 2 raw sector buffer
 static char buffer[CDIO_CD_FRAMESIZE_RAW];
 
-// Empty Form 2 sector
+// Empty Form 2 sector and Raw.
 static const uint8_t emptySector[M2F2_SECTOR_SIZE] = {0};
+static const uint8_t emptySectorRAW[CDIO_CD_FRAMESIZE_RAW] = {0};
 
 // Maximum number of sectors in an image
 const uint32_t MAX_ISO_SECTORS = 74 * 60 * 75;  // 74 minutes
@@ -106,120 +115,155 @@ std::string base64_decode(const std::string& encodedContent) {
 	return decodedContent;
 }
 
-// Simple .cue parser.
-std::vector<CueTrackInfo> parseCueFile(const std::string& cueContent) {
-	std::vector<CueTrackInfo> tracks;
-	std::istringstream cueStream(cueContent);
+std::vector<TrackInfo> parseTracksFromString(const std::string& input) {
+	std::vector<TrackInfo> tracks;
+	std::istringstream inputStream(input); // Treat the string as a stream
 	std::string line;
-	CueTrackInfo currentTrack;
-	std::string currentFilename;
-	int index00Sector = -1; // Initialize to -1 to indicate no pregap by default
 
-	std::regex fileRegex(R"(FILE \"([^\"]+)\" BINARY)");
-	std::regex trackRegex(R"(TRACK (\d+) (MODE2/2352|AUDIO))");
-	std::regex indexRegex(R"(INDEX (\d{2}) (\d{2}):(\d{2}):(\d{2}))");
-	std::regex pregapRegex(R"(PREGAP (\d{2}):(\d{2}):(\d{2}))");
+	while (std::getline(inputStream, line)) { // Split into lines
+		std::istringstream lineStream(line);
+		std::string field;
 
-	while (std::getline(cueStream, line)) {
-		std::smatch match;
+		TrackInfo track;
 
-		if (std::regex_search(line, match, fileRegex)) {
-			// Capture the filename for the current set of tracks
-			currentFilename = match[1];
-		} else if (std::regex_search(line, match, trackRegex)) {
-			if (currentFilename.empty()) {
-				throw std::runtime_error("CUE file format error: missing filename before TRACK definition.");
-			}
-			// Store the last track info before moving to the next track
-			if (currentTrack.trackNumber != 0) {
-				tracks.push_back(currentTrack);
-				currentTrack = CueTrackInfo();  // Reset the track object to default values
-			}
+		// Parse each field
+		std::getline(lineStream, field, ',');
+		track.trackNumber = std::stoi(field);
 
-			// Initialize a new track with the current filename
-			currentTrack.filename = currentFilename;
-			currentTrack.trackNumber = std::stoi(match[1]);
-			currentTrack.trackType = match[2];
-			currentTrack.pregapSectors = -1;  // Default to -1 to indicate no pregap explicitly set
-			index00Sector = -1; // Reset for new track
-		} else if (std::regex_search(line, match, pregapRegex)) {
-			// Parse PREGAP line and convert to sectors
-			int minutes = std::stoi(match[1]);
-			int seconds = std::stoi(match[2]);
-			int frames = std::stoi(match[3]);
-			currentTrack.pregapSectors = (minutes * 60 + seconds) * 75 + frames;
-		} else if (std::regex_search(line, match, indexRegex)) {
-			int indexNum = std::stoi(match[1]);
-			int minutes = std::stoi(match[2]);
-			int seconds = std::stoi(match[3]);
-			int frames = std::stoi(match[4]);
+		std::getline(lineStream, field, ',');
+		track.trackType = field;
 
-			int sector = (minutes * 60 + seconds) * 75 + frames;
+		std::getline(lineStream, field, ',');
+		track.startSector = std::stoi(field);
 
-			// Store INDEX 00 sector for pregap calculation
-			if (indexNum == 0) {
-				index00Sector = sector;
-			} else if (indexNum == 1) {
-				// Calculate pregap as the difference between INDEX 00 and INDEX 01, unless already set by PREGAP
-				if (currentTrack.pregapSectors == -1 && index00Sector != -1) {
-					currentTrack.pregapSectors = sector - index00Sector;
-				}
-			}
-		}
-	}
+		std::getline(lineStream, field, ',');
+		track.pregapSectors = std::stoi(field);
 
-	// Add the last track if available
-	if (currentTrack.trackNumber != 0) {
-		tracks.push_back(currentTrack);
+		std::getline(lineStream, field, ',');
+		track.dataOffset = std::stoi(field);
+
+		std::getline(lineStream, field, ',');
+		track.endSector = std::stoi(field);
+
+		std::getline(lineStream, field, ',');
+		track.totalSectors = std::stoi(field);
+
+		// Add the track to the list
+		tracks.push_back(track);
 	}
 
 	return tracks;
 }
 
-void writeBinWithPregap(std::vector<CueTrackInfo>& tracks, const std::filesystem::path& inputPath, const std::filesystem::path& outputPath) {
-	// Extract the directory and filename (without extension) from inputPath / outputPath
-	std::filesystem::path inputDir = inputPath.parent_path();
-	std::string baseNameWav = inputPath.stem().string();
-	std::filesystem::path outputDir = outputPath.parent_path();
-	std::string baseNameBin = outputPath.stem().string();
+std::string sectorsToTime(int sectors) {
+	int minutes = sectors / (75 * 60);
+	int seconds = (sectors / 75) % 60;
+	int frames = sectors % 75;
+	std::ostringstream timeStream;
+	timeStream << std::setw(2) << std::setfill('0') << minutes << ":"
+	           << std::setw(2) << std::setfill('0') << seconds << ":"
+	           << std::setw(2) << std::setfill('0') << frames;
+	return timeStream.str();
+}
 
-	for (auto& track : tracks) {  // Use auto& to modify each track directly
-		// Process only AUDIO tracks
+void generateCueFile(const std::vector<TrackInfo>& tracks, const fs::path& imageName, const fs::path& imageCueName) {
+	// Set the track offset. Only positive offset for strict mode.
+	int offset = (strictRebuild == 1) 
+	           ? ((track1SectorCountOffset > 0) ? track1SectorCountOffset : 0)
+	           : track1SectorCountOffset;
+	// Open the .cue file for writing
+	std::ofstream cueFile(imageCueName, std::ios::out | std::ios::trunc);
+	if (!cueFile.is_open()) {
+		throw std::runtime_error("Error creating .cue file: " + imageCueName.string());
+	}
+
+	// Write the FILE line (all tracks contained in one .bin file)
+	cueFile << "FILE \"" << imageName.filename().string() << "\" BINARY\n";
+
+	for (const auto& track : tracks) {
+		// Write the TRACK line
+		cueFile << "  TRACK " << std::setw(2) << std::setfill('0') << track.trackNumber
+		        << " " << track.trackType << "\n";
+
+		// Write the INDEX 00 line if pregap exists
+		if (track.pregapSectors > 0) {
+			int index00Sector = track.trackNumber == 1 ? track.startSector : track.startSector + offset;
+			cueFile << "    INDEX 00 " << sectorsToTime(index00Sector) << "\n";
+		}
+
+		// Write the INDEX 01 line
+		int index01Sector = track.trackNumber == 1 ? track.dataOffset : track.dataOffset + offset;
+		cueFile << "    INDEX 01 " << sectorsToTime(index01Sector) << "\n";
+	}
+
+	cueFile.close();
+	std::cout << "Cue file written to " << imageCueName << "..." << std::endl;
+}
+
+void writeAudioTracks(std::vector<TrackInfo>& tracks, const std::filesystem::path& inputPath, std::ofstream& image) {
+	for (const auto& track : tracks) {
 		if (track.trackType == "AUDIO") {
-			// Generate the new WAV filename using std::format
-			std::string wavFileName = std::format("{}/Track_{:02}.wav", baseNameWav, track.trackNumber);
-			std::filesystem::path fullPathWav = inputDir / wavFileName;
+			// Generate the WAV filename using the track information
+			// Process pregap if file exists
+			std::string wavFileName = std::format("Pregap_{:02}.wav", track.trackNumber);
+			std::filesystem::path fullPathWav = psxripDir / wavFileName;
+			std::ifstream wavFile;
+			char chunkHeader[4];
+			uint32_t chunkSize;
+			bool dataChunkFound = false;
+			std::vector<char> buffer(4096);
 
-			// Create the .bin filename in the format "outputname_trackXX.bin" using std::format
-			std::string binFileName = std::format("{}_track{:02}.bin", baseNameBin, track.trackNumber);
-			std::filesystem::path fullPathBin = outputDir / binFileName;
+			if (fs::exists(fullPathWav)) {
+				// Stream the audio data from the WAV file instead of loading it all into memory
+				wavFile.open(fullPathWav, std::ios::binary);
+				if (!wavFile) {
+					throw std::runtime_error("Error opening WAV file: " + fullPathWav.string());
+				}
 
-			// Update the filename in CueTrackInfo
-			track.filename = binFileName;
+				// Locate the "data" chunk after the RIFF header
+				wavFile.seekg(12);  // Skip RIFF, Chunk Size, and WAVE headers (4 + 4 + 4 bytes)
 
-			// Open the .bin file for writing
-			std::ofstream binFile(fullPathBin, std::ios::binary | std::ios::out | std::ios::trunc);
-			if (!binFile) {
-				throw std::runtime_error("Error creating bin file: " + fullPathBin.string());
+				while (wavFile.read(chunkHeader, 4)) {
+					wavFile.read(reinterpret_cast<char*>(&chunkSize), sizeof(chunkSize));
+
+					if (std::strncmp(chunkHeader, "data", 4) == 0) {
+						dataChunkFound = true;
+						break;
+					}
+
+					wavFile.seekg(chunkSize, std::ios::cur);
+				}
+
+				if (!dataChunkFound) {
+					throw std::runtime_error("Invalid WAV file (missing 'data' chunk): " + fullPathWav.string());
+				}
+
+				// Stream audio data in chunks to avoid high memory usage
+				while (wavFile.read(buffer.data(), buffer.size()) || wavFile.gcount() > 0) {
+					image.write(buffer.data(), wavFile.gcount());
+					if (!image) {
+						std::cerr << "Error writing audio data to image file for track: " << track.trackNumber << std::endl;
+						return;
+					}
+				}
+
+				wavFile.close();
+
 			}
 
-			// Write pregap (150 sectors of silence if applicable)
-			if (track.pregapSectors > 0) {
-				std::vector<char> silence(2352 * track.pregapSectors, 0);
-				binFile.write(silence.data(), silence.size());
-			}
+			// Process audio data
+			wavFileName = std::format("Track_{:02}.wav", track.trackNumber);
+			fullPathWav = psxripDir / wavFileName;
 
-			// Stream the audio data from the WAV file instead of loading it all into memory
-			std::ifstream wavFile(fullPathWav, std::ios::binary);
+			cdio_info("Writing WAV file: \"%s\" as audio track %2d...", wavFileName.c_str(), track.trackNumber);
+
+			wavFile.open(fullPathWav, std::ios::binary);
 			if (!wavFile) {
 				throw std::runtime_error("Error opening WAV file: " + fullPathWav.string());
 			}
 
-			// Locate the "data" chunk after the RIFF header
-			wavFile.seekg(12);  // Skip RIFF, Chunk Size, and WAVE headers (4 + 4 + 4 bytes)
-			char chunkHeader[4];
-			uint32_t chunkSize;
-			bool dataChunkFound = false;
+			wavFile.seekg(12);
+			dataChunkFound = false;
 
 			while (wavFile.read(chunkHeader, 4)) {
 				wavFile.read(reinterpret_cast<char*>(&chunkSize), sizeof(chunkSize));
@@ -236,72 +280,18 @@ void writeBinWithPregap(std::vector<CueTrackInfo>& tracks, const std::filesystem
 				throw std::runtime_error("Invalid WAV file (missing 'data' chunk): " + fullPathWav.string());
 			}
 
-			// Stream audio data in chunks to avoid high memory usage
-			std::vector<char> buffer(4096);
 			while (wavFile.read(buffer.data(), buffer.size()) || wavFile.gcount() > 0) {
-				binFile.write(buffer.data(), wavFile.gcount());
+				image.write(buffer.data(), wavFile.gcount());
+				if (!image) {
+					std::cerr << "Error writing audio data to image file for track: " << track.trackNumber << std::endl;
+					return;
+				}
 			}
 
-			binFile.close();
+			wavFile.close();
 
-		} else {
-			// Data track
-			track.filename = outputPath.string();
 		}
 	}
-}
-
-// Function to write .cue file
-void writeRebuildCueFile(const std::vector<CueTrackInfo>& tracks, const std::filesystem::path& outputPath) {
-	// Create the .cue filename based on outputPath's stem (filename without extension) and add ".cue"
-	std::filesystem::path cueFileName = outputPath.parent_path() / (outputPath.stem().string() + ".cue");
-
-	// Open the .cue file for writing
-	std::ofstream cueFile(cueFileName, std::ios::out | std::ios::trunc);
-	if (!cueFile) {
-		throw std::runtime_error("Error creating cue file: " + cueFileName.string());
-	}
-
-	// Write each track's information to the .cue file
-	for (const auto& track : tracks) {
-		// Write the FILE line
-		cueFile << "FILE \"" << track.filename << "\" BINARY\n";
-
-		// Write the TRACK line with track number and type (e.g., AUDIO or MODE2/2352)
-		cueFile << "  TRACK " << (track.trackNumber < 10 ? "0" : "") << track.trackNumber << " " << track.trackType << "\n";
-
-		// If it's an AUDIO track with an explicitly set pregap, write INDEX 00 and INDEX 01 with pregap time
-		if (track.trackType == "AUDIO" && track.pregapSectors > 0) {
-			// Calculate INDEX 01 time from pregapSectors
-			int totalSeconds = track.pregapSectors / 75;
-			int frames = track.pregapSectors % 75;
-			int minutes = totalSeconds / 60;
-			int seconds = totalSeconds % 60;
-
-			// Write INDEX 00 at 00:00:00
-			cueFile << "	INDEX 00 00:00:00\n";
-			// Write INDEX 01 with the calculated pregap time
-			cueFile << "	INDEX 01 "
-					<< std::setw(2) << std::setfill('0') << minutes << ":"
-					<< std::setw(2) << std::setfill('0') << seconds << ":"
-					<< std::setw(2) << std::setfill('0') << frames << "\n";
-		} else if (track.pregapSectors == -1) {
-			// No pregap explicitly defined in input, only write INDEX 01
-			cueFile << "	INDEX 01 00:00:00\n";
-		} else {
-			// Default INDEX 01 at 00:00:00 for non-AUDIO tracks or tracks without pregap
-			cueFile << "	INDEX 01 00:00:00\n";
-		}
-	}
-
-	cueFile.close();
-
-	std::cout << "Cue file written to " << cueFileName << std::endl;
-}
-
-// Check for .DA audio tracks.
-bool isDA(const std::string & str) {
-	return str.find(".DA;1") != std::string::npos;
 }
 
 // Convert string to integer.
@@ -427,8 +417,8 @@ struct CmpByName {
 
 // File (leaf) node
 struct FileNode : public FSNode {
-	FileNode(const string & name_, const fs::path & path_, DirNode * parent_, uint32_t startSector_ = 0, bool isForm2_ = false, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, string nodeDate_ = "", int16_t nodeTimezone_ = 0, uint32_t nodeSize_ = 0, bool nodeHidden_ = false, int nodeY2kbug_ = 0, bool nodeEDC_ = false)
-		: FSNode(name_, path_, parent_, startSector_), isForm2(isForm2_), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeDate(nodeDate_), nodeTimezone(nodeTimezone_), nodeSize(nodeSize_), nodeHidden(nodeHidden_), nodeY2kbug(nodeY2kbug_), nodeEDC(nodeEDC_)
+	FileNode(const string & name_, const fs::path & path_, DirNode * parent_, uint32_t startSector_ = 0, bool isForm2_ = false, bool isAudio_ = false, uint16_t nodeGID_ = 0, uint16_t nodeUID_ = 0, uint16_t nodeATR_ = 0, string nodeDate_ = "", int16_t nodeTimezone_ = 0, uint32_t nodeSize_ = 0, uint32_t nodeSizeOriginal_ = 0, bool nodeHidden_ = false, int nodeY2kbug_ = 0, bool nodeEDC_ = false)
+		: FSNode(name_, path_, parent_, startSector_), isForm2(isForm2_), isAudio(isAudio_), nodeGID(nodeGID_), nodeUID(nodeUID_), nodeATR(nodeATR_), nodeDate(nodeDate_), nodeTimezone(nodeTimezone_), nodeSize(nodeSize_), nodeSizeOriginal(nodeSizeOriginal_), nodeHidden(nodeHidden_), nodeY2kbug(nodeY2kbug_), nodeEDC(nodeEDC_)
 	{
 		// Check for the existence of the file and obtain its size
 		size = fs::file_size(path);
@@ -437,7 +427,7 @@ struct FileNode : public FSNode {
 		size_t blockSize = isForm2 ? M2RAW_SECTOR_SIZE : ISO_BLOCKSIZE;
 		numSectors = (size + blockSize - 1) / blockSize;
 
-		if (numSectors == 0 && !isDA(name_)) { // Disable sector count for CDDA.
+		if (numSectors == 0 && !isAudio) { // Disable sector count for DA tracks. They have to be processed seperately.
 			numSectors = 1;  // empty files use one sector
 		}
 	}
@@ -450,6 +440,7 @@ struct FileNode : public FSNode {
 	string nodeDateParent;
 	int16_t nodeTimezone;
 	uint32_t nodeSize;
+	uint32_t nodeSizeOriginal;
 	bool nodeHidden;
 	int nodeY2kbug;
 	bool nodeEDC;
@@ -459,6 +450,7 @@ struct FileNode : public FSNode {
 
 	// True if form 2 file
 	bool isForm2;
+	bool isAudio;
 
 	void accept(Visitor & v) { v.visit(*this); }
 };
@@ -528,6 +520,17 @@ void FSNode::traverseBreadthFirstSorted(Visitor & v)
 		for (vector<FSNode *>::const_iterator i = node->sortedChildren.begin(); i != node->sortedChildren.end(); ++i) {
 			q.push(*i);
 		}
+	}
+}
+
+
+void flattenTree(FSNode* node, std::vector<FSNode*>& flatList) {
+	// Add the current node to the flat list
+	flatList.push_back(node);
+
+	// Recursively process all children
+	for (auto* child : node->children) {
+		flattenTree(child, flatList);
 	}
 }
 
@@ -631,7 +634,7 @@ static void checkFileName(const string & s, const string & description)
 static void convertToEpochTime(const std::string& date, time_t& epoch_time) {
 	std::string new_date = date;
 	if (new_date.substr(0, 2) == "00" || new_date.substr(0, 2) == "19") { // The Y2K problem where years are encoded 00 for year 2000 instead of 64 hex.
-	  if (std::stoi(new_date.substr(2, 2)) >= 70) {
+		if (std::stoi(new_date.substr(2, 2)) >= 70) {
 			new_date.replace(0, 2, "19");
 		} else {
 			new_date.replace(0, 2, "20");
@@ -721,11 +724,11 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 		static const regex modificationDateSpec("modification_date\\s*(.*)");
 		static const regex expirationDateSpec("expiration_date\\s*(.*)");
 		static const regex effectiveDateSpec("effective_date\\s*(.*)");
-		static const regex original_cue_fileSpec("original_cue_file\\s*\\[(.*)\\]");
+		static const regex track_listingSpec("track_listing\\s*\\[(.*)\\]");
 		static const regex track1SectorCountSpec("track1_sector_count\\s*(\\d+)");
-		static const regex track1PostgapSectorsSpec("track1_postgap_sectors\\s*(\\d+)");
 		static const regex track1PostgapTypeSpec("track1_postgap_type\\s*(\\d+)");
 		static const regex audioSectorsSpec("audio_sectors\\s*(\\d+)");
+		static const regex strictRebuildSpec("strict_rebuild\\s*(\\d+)");
 		static const regex defaultUIDSpec("default_uid\\s*(\\d+)");
 		static const regex defaultGIDSpec("default_gid\\s*(\\d+)");
 		smatch m;
@@ -812,18 +815,13 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 			// Effective date specification
 			parse_ltime(m[1], cat.effectiveDate);
 
-		} else if (regex_match(line, m, original_cue_fileSpec)) {
+		} else if (regex_match(line, m, track_listingSpec)) {
 
-			// Original cue file
-			original_cue_file = base64_decode(m[1].str());
+			// tracklisting
+			track_listing = base64_decode(m[1].str());
 
 		} else if (regex_match(line, m, track1SectorCountSpec)) {
 			if (! str_to_num(m[1], track1SectorCount)) {
-				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
-			}
-
-		} else if (regex_match(line, m, track1PostgapSectorsSpec)) {
-			if (! str_to_num(m[1], track1PostgapSectors)) {
 				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
 			}
 
@@ -834,6 +832,11 @@ static void parseVolume(ifstream & catalogFile, Catalog & cat)
 
 		} else if (regex_match(line, m, audioSectorsSpec)) {
 			if (! str_to_num(m[1], audioSectors)) {
+				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
+			}
+
+		} else if (regex_match(line, m, strictRebuildSpec)) {
+			if (! str_to_num(m[1], strictRebuild)) {
 				throw runtime_error(format("'{}' is not a valid integer", m[1].str()));
 			}
 
@@ -912,7 +915,7 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, false, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeY2kbug, false);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, false, false, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeSize, nodeHidden, nodeY2kbug, false);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, xaFileSpec)) {
@@ -934,7 +937,7 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeY2kbug, nodeEDC);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, false, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeSize, nodeHidden, nodeY2kbug, nodeEDC);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, cddaFileSpec)) {
@@ -955,7 +958,7 @@ static DirNode * parseDir(ifstream & catalogFile, Catalog & cat, const string & 
 
 			uint32_t startSector = checkLBN(m[2], fileName);
 
-			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeHidden, nodeY2kbug, false);
+			FileNode * file = new FileNode(fileName + ";1", path / fileName, dir, startSector, false, true, nodeGID, nodeUID, nodeATR, nodeDate, nodeTimezone, nodeSize, nodeSize, nodeHidden, nodeY2kbug, false);
 			dir->children.push_back(file);
 
 		} else if (regex_match(line, m, dirStart)) {
@@ -1100,11 +1103,19 @@ public:
 	AllocSectors(uint32_t startSector_) : currentSector(startSector_) { }
 
 	uint32_t getCurrentSector() const { return currentSector; }
+	
+	std::vector<FileNode*> overflowFiles;
 
 	void visitNode(FSNode & node)
 	{
+		bool isAudio = false;
+		// Check if the node is a FileNode
+		if (FileNode* fileNode = dynamic_cast<FileNode*>(&node)) {
+			isAudio = fileNode->isAudio; // Access isAudio
+		}
+
 		// Minimum start sector requested?
-		if (node.requestedStartSector && !isDA(node.name)) { // Ignore for CDDA but keep the value instead of setting it to 0. Its neeed for the MakeDirectories function.
+		if (node.requestedStartSector && isAudio == false) { // Ignore for DA but keep the value instead of setting it to 0. Its needed for the MakeDirectories function.
 
 			// Yes, before current sector?
 			if (node.requestedStartSector < currentSector) {
@@ -1130,6 +1141,50 @@ public:
 
 	void visit(DirNode & dir) { visitNode(dir); }
 	void visit(FileNode & file) { visitNode(file); }
+
+	void allocateOverflowFiles()
+	{
+		for (auto* file : overflowFiles) {
+			size_t blockSize = file->isForm2 ? M2RAW_SECTOR_SIZE : ISO_BLOCKSIZE;
+			uint32_t overflowSectors = (file->size + blockSize - 1) / blockSize;
+
+			file->requestedStartSector = currentSector;  // Update start sector for overflow file
+			file->firstSector = currentSector;           // Assign firstSector
+			file->numSectors = overflowSectors;          // Update the number of sectors
+
+			currentSector += overflowSectors;
+			std::cerr << "Re-allocating overflow file: \"" << file->path.string()
+			          << "\" to sector " << file->firstSector << std::endl;
+		}
+	}
+
+	void allocate(std::vector<FSNode*>& flatList) {
+		for (auto* node : flatList) {
+			// Handle FileNode
+			if (FileNode* fileNode = dynamic_cast<FileNode*>(node)) {
+				if (fileNode->isAudio == true) { continue; }
+				// Calculate allocated size and actual size
+				size_t blockSize = fileNode->isForm2 ? M2RAW_SECTOR_SIZE : ISO_BLOCKSIZE;
+				uint32_t allocatedSectorsFile = (fileNode->size + blockSize - 1) / blockSize;
+				uint32_t allocatedSectorsTOC  = (fileNode->nodeSizeOriginal + ISO_BLOCKSIZE - 1) / ISO_BLOCKSIZE;
+
+				if (allocatedSectorsFile > allocatedSectorsTOC) {
+					std::cerr << "Overflow detected: \"" << fileNode->path.string()
+					          << "\" (sector count: " << allocatedSectorsFile
+					          << ", max allowed: " << allocatedSectorsTOC << ")" << std::endl;
+					overflowFiles.push_back(fileNode);  // Add to overflow list
+					continue;
+				}
+			}
+			if (node->requestedStartSector) {
+				node->firstSector = node->requestedStartSector;
+			} else {
+				node->firstSector = currentSector;
+			}
+				currentSector = node->firstSector + node->numSectors;
+		}
+	}
+
 
 private:
 	uint32_t currentSector;
@@ -1181,18 +1236,17 @@ public:
 				nodeTimezone = file->nodeTimezone;
 				nodeY2kbug = file->nodeY2kbug;
 				if (file->isForm2) {
-					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 1); // form2_file = 1555 hex or 5461 dec. form1_file = 0d55 hex or 3413 dec. Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec
-					if (isDA(node->name)) { // These are not processed normally. Recalculate size and startsector
-						iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 0); // form1_file = 0d55 hex or 3413 dec. Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec
-						size = file->nodeSize;
-						node->firstSector = node->requestedStartSector + track1SectorCountOffset; // Add the offset between the original and the new rebuild sector count to fix the CDDA entries.
-					}
+					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 1);
+				} else if (file->isAudio) {
+					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 0);
+					size = file->nodeSize;
+					node->firstSector = node->requestedStartSector + track1SectorCountOffset; // Add the offset between the original and the new rebuild sector count to fix the CDDA entries.
 				} else {
-					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 0); // Used values are 0911 hex or 2321 dec / 0915 hex or 2325 dec. UID = 0014 hex or 20 dec GID = 045d hex or 1117 dec.
+					iso9660_xa_init(&xaAttr, file->nodeUID, file->nodeGID, file->nodeATR, 0);
 					size = file->size;
 				}
 			} else if (DirNode * dir = dynamic_cast<DirNode *>(node)) {
-				iso9660_xa_init(&xaAttr, dir->nodeUID, dir->nodeGID, dir->nodeATR, 0); // form1_dir = 8d55 hex or 36181 dec   
+				iso9660_xa_init(&xaAttr, dir->nodeUID, dir->nodeGID, dir->nodeATR, 0);
 				nodeDate = dir->nodeDate;
 				nodeTimezone = dir->nodeTimezone;
 				nodeY2kbug = dir->nodeY2kbug;
@@ -1252,7 +1306,7 @@ public:
 
 	void visit(FileNode & file)
 	{
-		if (file.isForm2 && isDA(file.name)) { return; } // disable further processing of CDDA
+		if (file.isAudio) { return; } // Do not write DA files back as audio tracks. Process seperately.
 
 		ifstream f(file.path, ifstream::in | ifstream::binary);
 		if (!f) {
@@ -1323,6 +1377,15 @@ public:
 		}
 	}
 
+	// New method for writing from a flat list
+	void writeFromFlatList(const std::vector<FSNode*>& flatList)
+	{
+		for (auto* node : flatList) {
+			writeGap(node->firstSector);  // Ensure sectors are written in order
+			node->accept(*this);  // Call the appropriate visit method
+		}
+	}
+
 private:
 	ofstream & image;
 	uint32_t currentSector;
@@ -1331,7 +1394,7 @@ private:
 
 // Write the system area to the image file, optionally using the file
 // specified in the catalog as input.
-static void writeSystemArea(ofstream & image, const Catalog &cat)
+static void writeSystemArea(ofstream & image, const Catalog & cat)
 {
 	const size_t numSystemSectors = 16;
 	const size_t systemAreaSize = numSystemSectors * CDIO_CD_FRAMESIZE_RAW;
@@ -1361,7 +1424,6 @@ static void writeSystemArea(ofstream & image, const Catalog &cat)
 	for (size_t sector = 0; sector < numFileSectors; ++sector) {
 
 		// Data sectors
-		char buffer[CDIO_CD_FRAMESIZE_RAW];
 		memcpy(buffer, data.get() + sector * CDIO_CD_FRAMESIZE_RAW, CDIO_CD_FRAMESIZE_RAW);
 		image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 	}
@@ -1369,7 +1431,6 @@ static void writeSystemArea(ofstream & image, const Catalog &cat)
 	for (size_t sector = numFileSectors; sector < numSystemSectors; ++sector) {
 
 		// Empty sectors
-		char buffer[CDIO_CD_FRAMESIZE_RAW];
 		memset(buffer, 0, CDIO_CD_FRAMESIZE_RAW);
 		image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 	}
@@ -1454,6 +1515,7 @@ int main(int argc, char ** argv)
 
 		fs::path fsBasePath = inputPath;
 		fsBasePath.replace_extension("");
+		psxripDir = fsBasePath / "_PSXRIP";
 
 		cout << "Reading catalog file " << catalogName << "...\n";
 		cout << "Reading filesystem from directory " << fsBasePath << "...\n";
@@ -1479,25 +1541,35 @@ int main(int argc, char ** argv)
 
 		// Allocate start sectors to all nodes
 		AllocSectors alloc(rootDirStartSector);
-		cat.root->traverse(alloc);  // must use the same traversal order as "WriteData" below
+		std::vector<FSNode*> flatList;
+		// Strict rebuild uses the exact file / directory order according to the start sector.
+		if (strictRebuild == 1) {
+			std::cerr << "\nStrict mode set! All files are written back to their original LSN.\n"
+			          << "Files bigger then their allowed space are remapped to the end of track 1.\n" << std::endl;
+			flattenTree(cat.root, flatList);
+			std::sort(flatList.begin(), flatList.end(), [](FSNode* a, FSNode* b) {
+				return a->requestedStartSector < b->requestedStartSector;
+			});
+			alloc.allocate(flatList);
+			alloc.allocateOverflowFiles(); // Allocate overflow files
+			std::sort(flatList.begin(), flatList.end(), [](FSNode* a, FSNode* b) {
+				return a->requestedStartSector < b->requestedStartSector;
+			});
+		} else {
+			cat.root->traverse(alloc);  // must use the same traversal order as "WriteData" below
+		}
 
 		uint32_t volumeSize = alloc.getCurrentSector();
-		
-		// Add postgap sectors to the volumeSize
-		if (track1PostgapSectors && track1PostgapSectors > 70) {
-			volumeSize = volumeSize + track1PostgapSectors;
-		}
-		
-		// Add offset calculation from track1SectorCount and actual volumeSize for CDDA audio entries. Add the postgap for the correct start adress!
-		if (track1SectorCount > 150) {
-			track1SectorCountOffset = volumeSize - track1SectorCount;
-		}
 
-		// if CDDA add (filesize / 2352) to the volumeSize
-		if (audioSectors > 0) {
-			volumeSize = volumeSize + audioSectors;
-		}
-		
+		// Add postgap sectors of data track 1 to the volumeSize as they are not counted.
+		volumeSize = volumeSize + 150;
+
+		// Add offset calculation from track1SectorCount and actual volumeSize for CDDA audio entries.
+		track1SectorCountOffset = volumeSize - track1SectorCount;
+
+		// Add audio sectors to the volumeSize
+		volumeSize = volumeSize + audioSectors;
+
 		if (volumeSize > MAX_ISO_SECTORS) {
 			cerr << "Warning: Output image larger than "
 			     << (MAX_ISO_SECTORS * CDIO_CD_FRAMESIZE_RAW / (1024*1024)) << " MiB\n";
@@ -1523,6 +1595,8 @@ int main(int argc, char ** argv)
 		// Create the image file
 		fs::path imageName = outputPath;
 		imageName.replace_extension(".bin");
+		fs::path imageCueName = outputPath;
+		imageCueName.replace_extension(".cue");
 
 		ofstream image(imageName, ofstream::out | ofstream::binary | ofstream::trunc);
 		if (!image) {
@@ -1540,33 +1614,30 @@ int main(int argc, char ** argv)
 		struct tm rootTm;
 		time_t rootTime;
 
-		Catalog cat2;
-		cat2.creationDate = cat.creationDate;
-		cat2.modificationDate = cat.modificationDate;
+		iso9660_ltime_t creationDate = cat.creationDate;
 
-		string creationYear_str = std::string(cat2.creationDate.lt_year, 4);
-		int creationYear_int = std::stoi(std::string(cat2.creationDate.lt_year, 4));
+		int creationYear_int = std::stoi(std::string(creationDate.lt_year, 4));
 		if (creationYear_int == 0 || creationYear_int == 100) {
-			cat2.creationDate.lt_year[0] = '2';
-			cat2.creationDate.lt_year[1] = '0';
-			cat2.creationDate.lt_year[2] = '0';
-			cat2.creationDate.lt_year[3] = '0';
+			creationDate.lt_year[0] = '2';
+			creationDate.lt_year[1] = '0';
+			creationDate.lt_year[2] = '0';
+			creationDate.lt_year[3] = '0';
 		} else if (creationYear_int > 0 && creationYear_int < 30) {
-			cat2.creationDate.lt_year[0] = '2';
-			cat2.creationDate.lt_year[1] = '0';
+			creationDate.lt_year[0] = '2';
+			creationDate.lt_year[1] = '0';
 		} else if (creationYear_int >= 70 && creationYear_int < 99) {
-			cat2.creationDate.lt_year[0] = '1';
-			cat2.creationDate.lt_year[1] = '9';
+			creationDate.lt_year[0] = '1';
+			creationDate.lt_year[1] = '9';
 		} else if (creationYear_int >= 1900 && creationYear_int < 1970) {
-			cat2.creationDate.lt_year[0] = '2';
-			cat2.creationDate.lt_year[1] = '0';
+			creationDate.lt_year[0] = '2';
+			creationDate.lt_year[1] = '0';
 		}
 
-		iso9660_get_ltime(&cat2.creationDate, &rootTm);
+		iso9660_get_ltime(&creationDate, &rootTm);
 		rootTime = timegm(&rootTm) - (timeZone * (15 * 60));
 		gmtime_s(&rootTm, &rootTime);
 		if (y2kbug == 1) {
-		  rootTm.tm_year -= 100;
+			rootTm.tm_year -= 100;
 		}
 
 		iso9660_dir_t rootDirRecord;
@@ -1624,33 +1695,55 @@ int main(int argc, char ** argv)
 		image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 
 		// Write the directory and file data
-		WriteData writeData(image, rootDirStartSector);
-		cat.root->traverse(writeData);  // must use the same traversal order as "AllocSectors" above
+		if (strictRebuild == 1) {
+			WriteData writer(image, rootDirStartSector);
+			writer.writeFromFlatList(flatList);
+		} else {
+			WriteData writeData(image, rootDirStartSector);
+			cat.root->traverse(writeData);  // must use the same traversal order as "AllocSectors" above
+		}
 
 		// Write postgap. Usually 150 blank sectors which is standard.
-		if (track1PostgapSectors && track1PostgapSectors > 70) {
-			char buffer[CDIO_CD_FRAMESIZE_RAW];
-			char payload[CDIO_CD_FRAMESIZE_RAW];
-			memset(payload, 0, CDIO_CD_FRAMESIZE_RAW);
-			for (int i = 0; i < track1PostgapSectors; i++) {
+		fs::path lastSectorFilePath = psxripDir / "Last_sector.bin";
+		for (int i = 0; i < 150; i++) {
+			if (i == 149 && fs::exists(lastSectorFilePath)) {
+				_vcd_make_mode2(buffer, emptySectorRAW, i + alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0);
+				std::ifstream lastSectorFile(lastSectorFilePath, std::ios::binary);
+				if (lastSectorFile.is_open()) {
+					char fileSector[CDIO_CD_FRAMESIZE_RAW] = {0};
+					lastSectorFile.read(fileSector, CDIO_CD_FRAMESIZE_RAW);
+					constexpr int DATA_OFFSET = 24;
+					std::memcpy(buffer + DATA_OFFSET, fileSector + DATA_OFFSET, CDIO_CD_FRAMESIZE_RAW - DATA_OFFSET);
+					lastSectorFile.close();
+				}
+			} else {
 				if (track1PostgapType == 1) {
-					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0); // Type 1 is empty
+					_vcd_make_mode2(buffer, emptySectorRAW, i+alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0); // Type 1 is empty
 				} else if (track1PostgapType == 2){
-					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, SM_FORM2, 0); // Type 2 has Mode2 bytes set.
+					_vcd_make_mode2(buffer, emptySectorRAW, i+alloc.getCurrentSector(), 0, 0, SM_FORM2, 0); // Type 2 has Mode2 bytes set.
 				} else if (track1PostgapType == 3){
-					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, SM_FORM2, 0); // Type 3 has Mode2 bytes set and EDC.
+					_vcd_make_mode2(buffer, emptySectorRAW, i+alloc.getCurrentSector(), 0, 0, SM_FORM2, 0); // Type 3 has Mode2 bytes set and EDC.
 				} else {
-					_vcd_make_mode2(buffer, payload, i+alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0); // Empty for now, need to write raw dumper.
+					_vcd_make_mode2(buffer, emptySectorRAW, i+alloc.getCurrentSector(), 0, 0, CN_EMPTY, 0); // Unknown or Empty with garbage in last sector.
 				}
-				if (buffer[18] == 0x20 && track1PostgapType != 3) { // Zero out the last 4 EDC bytes for type 2.
-					buffer[2348] = '\0';
-					buffer[2349] = '\0';
-					buffer[2350] = '\0';
-					buffer[2351] = '\0';
-				}
-				image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 			}
+			if (buffer[18] == 0x20 && track1PostgapType != 3) { // Zero out the last 4 EDC bytes for type 2.
+				buffer[2348] = '\0';
+				buffer[2349] = '\0';
+				buffer[2350] = '\0';
+				buffer[2351] = '\0';
+			}
+			image.write(buffer, CDIO_CD_FRAMESIZE_RAW);
 		}
+
+		// Parse the track information from the catalog file.
+		std::vector<TrackInfo> tracks = parseTracksFromString(track_listing);
+
+		// Append the stored .wav files.
+		writeAudioTracks(tracks, inputPath, image);
+
+		// Write the .cue file
+		generateCueFile(tracks, imageName, imageCueName);
 
 		// Close the image file
 		if (!image) {
@@ -1658,16 +1751,7 @@ int main(int argc, char ** argv)
 		}
 		image.close();
 
-		cout << "Image file written to " << imageName << endl;
-
-		// Process stored .cue file.
-		std::vector<CueTrackInfo> tracks = parseCueFile(original_cue_file);
-
-		// Process stored .wav files.
-		writeBinWithPregap(tracks, inputPath, outputPath);
-
-		// Write the .cue file
-		writeRebuildCueFile(tracks, outputPath);
+		cout << "Image file written to " << imageName << "..." << endl;
 
 		cdio_info("Done.");
 

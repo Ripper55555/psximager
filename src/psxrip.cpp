@@ -47,31 +47,23 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std;
 
-#define TOOL_VERSION "PSXRip v2.2.5 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXRip v2.2.6 (Win32 build by ^Ripper)"
+
 #ifdef _WIN32
 	#define timegm _mkgmtime
 #endif
 
 bool fixAllDates = false;
+bool writeStrict = false;
 
-// base64 encoded cue file
-string cueFileEncoded = "";
+fs::path psxripDir;
 
 // Y2k / root entry processing error
 struct tm rootEntryReplacementTm;
 
-// Audio sector counter
-int audioSectors = 0;
-
-// GMT
-int gmtValue = 0;
-int gmtValueParent = 0;
-
 // Sector buffer
 static char buffer[M2RAW_SECTOR_SIZE];
-
-// Identify type of postgap
-int track1PostgapType;
+static char bufferRAW[CDIO_CD_FRAMESIZE_RAW];
 
 // Gzip compress and Base64 encode text string
 std::string base64_encode(const std::string& input) {
@@ -119,30 +111,12 @@ std::string base64_encode(const std::string& input) {
 	return base64EncodedContent;
 }
 
-// To hex function.
-std::string toHexString(const uint8_t* data, const size_t size) {
-	std::string hex_str;
-	hex_str.reserve(size * 2); // reserve enough space to avoid reallocations
-
-	static const char hex_chars[] = "0123456789ABCDEF";
-
-	for (size_t i = 0; i < size; i++) {
-		uint8_t byte = data[i];
-		hex_str.push_back(hex_chars[byte >> 4]);
-		hex_str.push_back(hex_chars[byte & 0x0F]);
-	}
-
-	return hex_str;
-}
-
 // Print an ISO long-format time structure to a file.
 static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_time = false)
 {
 	// Assuming Y2K bug on creation_date / root directory record on some ISO's where the PVD date year is reported as 0000 instead of 19xx or 20xx.
 	// stat->tm Bug on root record. When the date on the filesystem reads 00 hex instead of the years after 1900 in hex. This messes up epoch calculations.
 	// All the stat->tm.xxx fields are corrupted, so we need a replacement. Luckely the pvd.creation_date is correct all but the year.
-	// I cannot write the faulty code back due to epoch on 32 bit not going far enough back (1901).
-	// So instead of that it writes the corrected date back. Not 1:1 but the next best thing.
 	std::string century_str = {l.lt_year[0], l.lt_year[1]};
 	std::string year_str = {l.lt_year[2], l.lt_year[3]};
 	std::string month_str = {l.lt_month[0], l.lt_month[1]};
@@ -151,10 +125,6 @@ static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_t
 	std::string minute_str = {l.lt_minute[0], l.lt_minute[1]};
 	std::string second_str = {l.lt_second[0], l.lt_second[1]};
 
-	if (creation_time == true && l.lt_gmtoff != 0) {
-		gmtValue = l.lt_gmtoff; // Change the global gmtValue if not 0. But only for the creation date.
-	}
-	
 	if (creation_time == true) {
 		rootEntryReplacementTm.tm_year = std::stoi(year_str);
 		rootEntryReplacementTm.tm_mon = std::stoi(month_str) - 1;
@@ -185,7 +155,7 @@ static void print_ltime(ofstream & f, const iso9660_ltime_t & l, bool creation_t
 
 
 // Dump system area data from image to file.
-static void dumpSystemArea(CdIo_t *image, const fs::path & fileName)
+static void dumpSystemArea(CdIo_t * image, const fs::path & fileName)
 {
 	ofstream file(fileName, ofstream::out | ofstream::binary | ofstream::trunc);
 	if (!file) {
@@ -194,13 +164,12 @@ static void dumpSystemArea(CdIo_t *image, const fs::path & fileName)
 
 	const size_t numSystemAreaSectors = 16;
 	for (size_t sector = 0; sector < numSystemAreaSectors; ++sector) {
-		char buffer[CDIO_CD_FRAMESIZE_RAW];
-		driver_return_code_t r = cdio_read_audio_sectors(image, buffer, sector, 1);
+		driver_return_code_t r = cdio_read_audio_sector(image, bufferRAW, sector);
 		if (r != DRIVER_OP_SUCCESS) {
 			throw runtime_error(format("Error reading sector {} of image file: {}", sector, cdio_driver_errmsg(r)));
 		}
 
-		file.write(buffer, CDIO_CD_FRAMESIZE_RAW);
+		file.write(bufferRAW, CDIO_CD_FRAMESIZE_RAW);
 		if (!file) {
 			throw runtime_error(format("Cannot write to system area file {}", fileName.string()));
 		}
@@ -366,13 +335,13 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 				uint16_t attr = uint16_from_be(stat->xa.attributes);
 				if (attr & (XA_ATTR_MODE2FORM2 | XA_ATTR_INTERLEAVED)) {
 					cdio_info("XA file '%s' size = %u, secsize = %u, group_id = %d, user_id = %d, attributes = %04x, filenum = %d",
-					entryName.c_str(), stat->size, stat->secsize, stat->xa.group_id, stat->xa.user_id, attr, stat->xa.filenum);
+					          entryName.c_str(), stat->size, stat->secsize, stat->xa.group_id, stat->xa.user_id, attr, stat->xa.filenum);
 					form2File = true;
 				}
 
 				if (attr & XA_ATTR_CDDA) {
-					cdio_info("XA file '%s' size = %u, secsize = %u, group_id = %d, user_id = %d, attributes = %04x, filenum = %d",
-					entryName.c_str(), stat->size, stat->secsize, stat->xa.group_id, stat->xa.user_id, attr, stat->xa.filenum);
+					cdio_info("DA file '%s' size = %u, secsize = %u, group_id = %d, user_id = %d, attributes = %04x, filenum = %d",
+					          entryName.c_str(), stat->size, stat->secsize, stat->xa.group_id, stat->xa.user_id, attr, stat->xa.filenum);
 					cddaFile = true;
 				}
 			}
@@ -407,37 +376,33 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 
 			size_t sizeRemaining = fileSize;
 
-			char bufferTest[CDIO_CD_FRAMESIZE_RAW];
 			bool edcTest = false;
 
 			for (uint32_t sector = 0; sector < stat->secsize; ++sector) {
-				memset(buffer, 0, blockSize);
-				memset(bufferTest, 0, CDIO_CD_FRAMESIZE_RAW);
-
 				driver_return_code_t r;
 				if (form2File) {
 					// Check for EDC status. Tricky one as XA files can have audio and video sectors. Mode 2-1/Mode 2-2 interleaved. So until a positive hit, keep scanning.
 					if (edcTest == false) {
-						r = cdio_read_audio_sectors(image, bufferTest, stat->lsn + sector, 1);
+						r = cdio_read_audio_sector(image, bufferRAW, stat->lsn + sector);
 						if (r != DRIVER_OP_SUCCESS) {
 							cerr << format("Error reading sector {} of image file: {}", stat->lsn + sector, cdio_driver_errmsg(r)) << endl;
 							cerr << format("Output file {} may be incomplete", outputFileName.string()) << endl;
 							break;
 						}
-						if ((bufferTest[18] & 0x20) == 0x20 && bufferTest[2348] == '\0' && bufferTest[2349] == '\0' && bufferTest[2350] == '\0' &&	bufferTest[2351] == '\0') { // If bit 6 is "1" and the last 4 bytes are "0" then its Mode 2/Form 2 with zeroed out EDC.
+						if ((bufferRAW[18] & 0x20) == 0x20 && bufferRAW[2348] == '\0' && bufferRAW[2349] == '\0' && bufferRAW[2350] == '\0' &&	bufferRAW[2351] == '\0') { // If bit 6 is "1" and the last 4 bytes are "0" then its Mode 2/Form 2 with zeroed out EDC.
 							edcTest = true;
 						}
 					}
 					r = cdio_read_mode2_sector(image, buffer, stat->lsn + sector, 1);
 				} else if (cddaFile) {
-				  cdio_info("Skipping CD-DA file...");
-				  break;
+					cdio_info("Skipping CD-DA file...");
+					break;
 				} else {
 					r = cdio_read_data_sectors(image, buffer, stat->lsn + sector, blockSize, 1);
 				}
 				if (r != DRIVER_OP_SUCCESS) {
 					cerr << format("Error reading sector {} of image file: {}", stat->lsn + sector, cdio_driver_errmsg(r)) << endl;
-					cerr << format("Output file {} may be incomplete (Ignore this error on CD-DA files!)", outputFileName.string()) << endl;
+					cerr << format("Output file {} may be incomplete", outputFileName.string()) << endl;
 					break;
 				}
 
@@ -469,7 +434,7 @@ static void dumpFilesystem(CdIo_t * image, ofstream & catalog, bool writeLBNs,
 
 
 // Dump image to system area data, catalog file, and output directory.
-static void dumpImage(CdIo_t * image, const fs::path & outputPath, bool writeLBNs, int track1PostgapSectors, int track1PostgapType, int track1SectorCount)
+static void dumpImage(CdIo_t * image, const fs::path & outputPath, bool writeLBNs, string trackListingEncoded, int track1PostgapType, int track1SectorCount, int audioSectors)
 {
 	// Read ISO volume information
 	iso9660_pvd_t pvd;
@@ -515,11 +480,11 @@ static void dumpImage(CdIo_t * image, const fs::path & outputPath, bool writeLBN
 	catalog << "  modification_date "; print_ltime(catalog, pvd.modification_date);
 	catalog << "  expiration_date "; print_ltime(catalog, pvd.expiration_date);
 	catalog << "  effective_date "; print_ltime(catalog, pvd.effective_date);
-	catalog << "  original_cue_file [" << cueFileEncoded << "]\n";
+	catalog << "  track_listing [" << trackListingEncoded << "]\n";
 	catalog << "  track1_sector_count " << track1SectorCount << "\n";
-	catalog << "  track1_postgap_sectors " << track1PostgapSectors << "\n";
 	catalog << "  track1_postgap_type " << track1PostgapType << "\n";
 	catalog << "  audio_sectors " << audioSectors << "\n";
+	catalog << "  strict_rebuild " << (writeStrict ? "1" : "0") << "\n";
 	catalog << "}\n\n";
 
 	// Dump ISO filesystem
@@ -609,8 +574,11 @@ static void dumpLBNTable(CdIo_t * image, const string & inputPath = "", ostream 
 static void usage(const char * progname, int exitcode = 0, const string & error = "")
 {
 	cout << "Usage: " << fs::path(progname).filename().string() << " [OPTION...] <input>[.bin/cue] [<output_dir>]" << endl;
-	cout << "  -f, --fix                       Fix problematic file/directory/catalog dates instead of preserving them" << endl;
+	cout << "  -f, --fix                       Fix problematic file/directory/catalog dates" << endl;
+	cout << "                                  instead of preserving them" << endl;
 	cout << "  -l, --lbns                      Write LBNs to catalog file" << endl;
+	cout << "  -s, --strict                    Rebuild writes to original LBN. Implied -l." << endl;
+	cout << "                                  Oversized files get remapped." << endl;
 	cout << "  -t, --lbn-table                 Print LBN table and exit" << endl;
 	cout << "  -v, --verbose                   Be verbose" << endl;
 	cout << "  -V, --version                   Display version information and exit" << endl;
@@ -643,6 +611,9 @@ int main(int argc, const char ** argv)
 			fixAllDates = true;
 		} else if (arg == "--lbns" || arg == "-l") {
 			writeLBNs = true;
+		} else if (arg == "--strict" || arg == "-s") {
+			writeStrict = true;
+			writeLBNs = true;
 		} else if (arg == "--lbn-table" || arg == "-t") {
 			printLBNTable = true;
 		} else if (arg == "--verbose" || arg == "-v") {
@@ -671,12 +642,28 @@ int main(int argc, const char ** argv)
 		outputPath.replace_extension("");
 	}
 
+	fs::path psxripDir = outputPath / "_PSXRIP";
+
 	try {
 
 		// Open the input image (Force .cue extension on input argument! Libcdio will moan otherwise.)
 		inputPath.replace_extension(".cue");
 
 		cout << "Analyzing image " << inputPath << "...\n";
+
+		bool isMultiBin = false;
+		int trackCount = 0;
+		int fileCount = 0;
+		int audioSectors = 0;
+		string trackListingEncoded = "";
+
+		// Ensure the output directory exists
+		if (!fs::exists(psxripDir)) {
+			if (!fs::create_directories(psxripDir)) {
+				printf("Failed to create output directory\n");
+				return 1;
+			}
+		}
 
 		if (fs::exists(inputPath)) {
 			// Open the cue file and encode in base64 string.
@@ -694,11 +681,36 @@ int main(int argc, const char ** argv)
 			}
 
 			file.close();
-			cueFileEncoded = base64_encode(cueContent);
+
+			std::regex trackRegex("(?:^|\\n)\\s*TRACK\\b", std::regex::icase);
+			std::regex fileRegex("(?:^|\\n)\\s*FILE\\b", std::regex::icase);
+
+			trackCount = std::distance(
+				std::sregex_iterator(cueContent.begin(), cueContent.end(), trackRegex),
+				std::sregex_iterator()
+			);
+
+			fileCount = std::distance(
+				std::sregex_iterator(cueContent.begin(), cueContent.end(), fileRegex),
+				std::sregex_iterator()
+			);
+
+			if (fileCount == 1 && trackCount >= 1) {
+				isMultiBin = false; // Single-bin
+			} else if (fileCount > 1 && fileCount == trackCount) {
+				isMultiBin = true; // Multi-bin
+			} else {
+				throw std::runtime_error("Error: The .cue file is inconsistent. FILE and TRACK counts do not align.");
+			}
+
+			cdio_info("Cue file parsed. Files: %02d, Tracks: %02d, Multiple .BIN files: %s",	fileCount, trackCount, isMultiBin ? "true" : "false");
 
 		} else {
 			throw std::runtime_error("Error: '" + inputPath.string() + "' file not found.");
 		}
+
+		cdio_info("Libcdio track parser:");
+		cdio_info("Track  Index 00  Index 01  Silence  Start LBA  Pregap  Data LBA  End LBA   Total  Filename");
 
  		CdIo_t * image = cdio_open(inputPath.generic_string().c_str(), DRIVER_BINCUE);
 
@@ -710,45 +722,62 @@ int main(int argc, const char ** argv)
 		track_t first_track = cdio_get_first_track_num(image);
 		track_t last_track = cdio_get_last_track_num(image);
 		if (last_track > first_track) {
-			cout << "Dumping audio tracks to directory " << outputPath << "...\n";
+			cout << "Dumping audio tracks to directory \"" << psxripDir.string() << "\"...\n";
 		}
 
 		// Iterate through the tracks to find the audio track
-		lsn_t track1PostgapSectors = 150;
-		lsn_t last_lsnTrack1 = 0;
+		lsn_t last_sector_track1_postgap = 0;
+		// { "CDIO_DISC_MODE_CD_DA", "CDIO_DISC_MODE_CD_DATA", "CDIO_DISC_MODE_CD_XA", "CDIO_DISC_MODE_CD_MIXED", ... }
 		discmode_t discMode = cdio_get_discmode(image);
-		
+		const char *track1Format = "";
+		std::string csvTracks = "";
+
+		cdio_info("PSXRip track reparser:");
+		cdio_info("Track  Filesystem  Sector type      Start LBA  Pregap  Data LBA  End LBA   Total");
+
 		for (track_t track = first_track; track <= last_track; track++) {
 			track_format_t format = cdio_get_track_format(image, track);
-
-			// Get the start and end sector of the track
-			lsn_t pregap_sector = cdio_get_track_pregap_lba(image, track);  // Pregap size
-			pregap_sector = (pregap_sector < 0 ? 0 : pregap_sector);        // Correct pregap if it has a bogus negative number.
-			lsn_t start_sector = cdio_get_track_lba(image, track);          // The actual start before pregap
-			lsn_t data_sector = start_sector + pregap_sector;               // After pregap where the actual data is
-			lsn_t end_sector = cdio_get_track_last_lsn(image, track);       // Last sector
-			lsn_t total_sector = cdio_get_track_sec_count(image, track);    // Total sector amount
-
-			// Issue with the last track. Always +150 sectors. The faked lead out?
-			// When there is only a data track, then this also counts as "last track".
-			if (track == last_track) {
-				total_sector = total_sector - 150;
+			// { "AUDIO", "CD-i", "XA", "DATA", "PSX", "ERROR" }
+			const char *format_str = (format >= 0 && format < 6) ? track_format2str[format] : "ERROR";
+			if (track == 1) {
+				track1Format = format_str;
 			}
 
-			// Disc mode (Mixed mode) issue.
-			// cdio_get_track_last_lsn() under reports by 150 sectors all but the last track.
-			// This does not happen in XA mode when you strip the audio from the .cue file.
-			if (discMode == 3 && track != last_track) {
-				end_sector = end_sector + 150;
-			}
+			trackmode_t format_mode = cdio_get_track_mode(image, track);
+			// { "AUDIO", "MODE1/2048", "MODE1/2352", "MODE2/2336", "MODE2/2048", "MODE2/2324", "MODE2/2336", "MODE2/2352", "ERROR" }
+			const char *format_mode_str = (format_mode >= 0 && format_mode < 9) ? track_format_mode2str[format_mode] : "ERROR";
+
+			// Get the start, end and total sectors of the track
+			// These are reliable and the values are the same as in libcdio's cue parser.
+			// cdio_get_track_end_sector was created to remove hacky code.
+			lsn_t pregap_sector = std::max(cdio_get_track_pregap_lba(image, track), 0); // Pregap size. Corrected if bogus negative number.
+			lsn_t start_sector  = cdio_get_track_lba(image, track) - pregap_sector;     // Track start sector before pregap
+			lsn_t data_sector   = cdio_get_track_lba(image, track);                     // Data start sector after the pregap (the actual data)
+			lsn_t end_sector    = cdio_get_track_end_sector(image, track);              // Track ending sector.
+			lsn_t total_sector  = end_sector - start_sector + 1;                        // Total sector amount for the track including pregap.
+			// These are unreliable across different disc types and modes!
+			// cdio_get_track_last_lsn()
+			// cdio_get_track_sec_count()
+			// Lead out is added to the last track and messes up the calculations.
 
 			if (track == 1) {
-				last_lsnTrack1 = end_sector;
+				last_sector_track1_postgap = end_sector;
 			}
 
-			const char *format_str = (format >= 0 && format < 6) ? track_format2str[format] : "error";
-			cdio_info("Track %02d [%-5s] Pregap: %7d, Start: %7d, Data offset: %7d, End: %7d, Size: %7d",
-									track, format_str, pregap_sector, start_sector, data_sector, end_sector, total_sector);
+			if (track == 2 && isMultiBin == false) {
+				last_sector_track1_postgap = start_sector - 1;
+			}
+
+			cdio_info("%-5d  %-10s  %-15s  %9d  %6d  %8d  %7d  %6d",
+									track, format_str, format_mode_str, start_sector, pregap_sector, data_sector, end_sector, total_sector);
+
+			csvTracks += std::to_string(track) + "," +
+			             std::string(format_mode_str) + "," +
+			             std::to_string(start_sector) + "," +
+			             std::to_string(pregap_sector) + "," +
+			             std::to_string(data_sector) + "," +
+			             std::to_string(end_sector) + "," +
+			             std::to_string(total_sector) + "\n";
 
 			// Check if the track is an audio track
 			if (format == TRACK_FORMAT_AUDIO) {
@@ -758,16 +787,8 @@ int main(int argc, const char ** argv)
 				char filename[50];
 				sprintf(filename, "Track_%02d.wav", track);
 
-				fs::path fullPathAudio = outputPath / filename;
+				fs::path fullPathAudio = psxripDir / filename;
 				std::string fullPathAudioStr = fullPathAudio.string();
-
-				// Ensure the output directory exists
-				if (!fs::exists(outputPath)) {
-					if (!fs::create_directories(outputPath)) {
-						printf("Failed to create output directory\n");
-						return 1;
-					}
-				}
 
 				// Open a file to write the audio data
 				FILE *audio_file = fopen(fullPathAudioStr.c_str(), "wb");
@@ -802,34 +823,67 @@ int main(int argc, const char ** argv)
 				// Write WAV header
 				fwrite(header, 1, 44, audio_file);
 
-				// Read each sector and write audio data to the file
-				uint8_t buffer[CDIO_CD_FRAMESIZE_RAW];
+				// Read each sector and write audio data to the file (Including pregap! Can contain hidden data!)
 				for (lsn_t sector = data_sector; sector <= end_sector; sector++) {
-					cdio_read_audio_sector(image, buffer, sector);
-					fwrite(buffer, 1, CDIO_CD_FRAMESIZE_RAW, audio_file);
+					driver_return_code_t r = cdio_read_audio_sector(image, bufferRAW, sector);
+					if (r != DRIVER_OP_SUCCESS) {
+							std::cerr << "Error reading sector " << sector << " of image file: " << cdio_driver_errmsg(r) << std::endl;
+					}
+					fwrite(bufferRAW, 1, CDIO_CD_FRAMESIZE_RAW, audio_file);
 				}
 
 				fclose(audio_file);
+				
+				// Now take care of the pregap
+				if (pregap_sector > 0) {
+					sprintf(filename, "Pregap_%02d.wav", track);
+
+					fullPathAudio = psxripDir / filename;
+					fullPathAudioStr = fullPathAudio.string();
+
+					audio_file = fopen(fullPathAudioStr.c_str(), "wb");
+					if (audio_file == NULL) {
+						printf("Failed to open output file\n");
+						return 1;
+					}
+					data_size = (total_sector - pregap_sector) * CDIO_CD_FRAMESIZE_RAW;
+					memcpy(header, wav_header, 44);
+					*(uint32_t *)(header + 4) = 36 + data_size;
+					*(uint32_t *)(header + 40) = data_size;
+
+					fwrite(header, 1, 44, audio_file);
+
+					for (lsn_t sector = start_sector; sector < data_sector; sector++) {
+						driver_return_code_t r = cdio_read_audio_sector(image, bufferRAW, sector);
+						if (r != DRIVER_OP_SUCCESS) {
+								std::cerr << "Error reading sector " << sector << " of image file: " << cdio_driver_errmsg(r) << std::endl;
+						}
+						fwrite(bufferRAW, 1, CDIO_CD_FRAMESIZE_RAW, audio_file);
+					}
+
+					fclose(audio_file);
+				}
 			}
 		}
 
-		// Get total sector count of track 1.
-		cdio_info("Track 1 sector count = %d", last_lsnTrack1 + 1);
+		// Base64 encode the cvsTracks for the catalog file.
+		trackListingEncoded = base64_encode(csvTracks);
 
-		// Processing postgap of the data track.
-		cdio_info("Track 1 postgap sectors = %d", track1PostgapSectors);
+		// Identifying the postgap type of the data track.
+		int track1PostgapType = 0;
 
-		if (track1PostgapSectors >= 150) {
-			char postGapBuffer[CDIO_CD_FRAMESIZE_RAW];
-			driver_return_code_t r = cdio_read_audio_sectors(image, postGapBuffer, (last_lsnTrack1), 1);
+		if (strcmp(track1Format, "XA") == 0) {
+			driver_return_code_t r = cdio_read_audio_sector(image, bufferRAW, last_sector_track1_postgap);
 			if (r != DRIVER_OP_SUCCESS) {
-			  throw runtime_error(format("Error reading sector {} of image file: {}", (last_lsnTrack1 - 1), cdio_driver_errmsg(r)));
+				throw runtime_error(format("Error reading sector {} of image file: {}", last_sector_track1_postgap, cdio_driver_errmsg(r)));
+			}
+			std::string postGapHex;
+			for (size_t i = 0; i < CDIO_CD_FRAMESIZE_RAW; ++i) {
+				postGapHex += std::format("{:02X}", bufferRAW[i]);
 			}
 			std::regex postgapType1("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000000000000000(00)*$"); // Empty
 			std::regex postgapType2("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000200000002000(00)*$"); // Mode2
 			std::regex postgapType3("^00FFFFFFFFFFFFFFFFFFFF00.{8}0000200000002000(00)*([0-9A-F]){8}$"); // Mode2 with EDC
-			std::vector<uint8_t> postGapVector(postGapBuffer, postGapBuffer + CDIO_CD_FRAMESIZE_RAW);
-			std::string postGapHex = toHexString(postGapVector.data(), postGapVector.size());
 
 			if (std::regex_match(postGapHex, postgapType1)) {
 				track1PostgapType = 1;
@@ -838,7 +892,19 @@ int main(int argc, const char ** argv)
 			} else if (std::regex_match(postGapHex, postgapType3)) {
 				track1PostgapType = 3;
 			} else {
-				track1PostgapType = 0; // Unknown, possibly dump it raw. Need to write that.
+				track1PostgapType = 0; // Unknown or Empty with garbage in last sector. Dump last sector for rebuild.
+
+				std::string lastSectorFile = "Last_sector.bin";
+				fs::path fullPathLastSector = psxripDir / lastSectorFile;
+				std::string fullPathLastSectorStr = fullPathLastSector.string();
+
+				FILE *last_sector_file = fopen(fullPathLastSectorStr.c_str(), "wb");
+				if (last_sector_file == NULL) {
+					printf("Failed to open output file\n");
+					return 1;
+				}
+				fwrite(bufferRAW, 1, CDIO_CD_FRAMESIZE_RAW, last_sector_file);
+				fclose(last_sector_file);
 			}
 		}
 
@@ -890,13 +956,13 @@ int main(int argc, const char ** argv)
 		} else {
 
 			// Dump the input image
-			dumpImage(image, outputPath, writeLBNs, track1PostgapSectors, track1PostgapType, last_lsnTrack1 + 1);
+			dumpImage(image, outputPath, writeLBNs, trackListingEncoded, track1PostgapType, last_sector_track1_postgap + 1, audioSectors);
 		}
 
 		// Close the input image
 		cdio_destroy(image);
 		cdio_info("Done.");
-		
+
 	} catch (const std::exception & e) {
 		cerr << e.what() <<endl;
 		return 1;

@@ -1,15 +1,15 @@
-PSXImager V2.2.5 (Win32 build by ^Ripper)
+PSXImager V2.2.6 (Win32 build by ^Ripper)
 =========================================
 
 **Important**
 This fork build has been made for a specific game I'm working on, but can
 also be used for other projects.
 
-Its aim is to dump the ISO to the harddisk for ease of editing.
+Its aim is to dump the ISO to the hard drive for ease of editing.
 After which the psxbuild program rebuilds it back to a CD image.
 This process mimics mastering so well that an unedited version usually
 produces a 1:1 ISO with the same checksum. That way you know the files
-are always at the same sector number and nothing has been altered.
+are always at the same sector number, and nothing has been altered.
 So this provides a solid basis for editing the game.
 
 Changes have been made in how the directory is being rebuilt.
@@ -18,14 +18,14 @@ This means that you can make a 1:1 perfect rebuild of the ripped ISO.
 
 There is a caveat though.
 If the original ISO had been built with buggy tools or special data had
-been inserted then a full 1:1 rebuild will fail.
+been inserted, then a full 1:1 rebuild will fail.
 But a good file compare program can show you how well it worked and show
-you the extra/odd data put in.
+the extra/odd data put in.
 
 Libcdio has been patched to fix issues or missing functions.
 Some of the fixes include:
 
-- The 16 sector system area now gets dumped raw.
+- The 16-sector system area now gets dumped raw.
   EDC errors and all because they are there by design.
 - Fix the hidden flag always stuck on 1 (hidden)
 - All dates preserved instead of defaulting pvd.creation_time for all.
@@ -44,22 +44,38 @@ Some of the fixes include:
   - Full copy of the .CUE file in base64 when ripped.
     For use in rebuilding a new .CUE file.
   - Rebuild the postgap of the data track that is missing.
-    Data track 1 sector count, postgap sector count and postgap type.
-    Postgap type can detect 3 common types or defaults to all zero's.
+    Data track 1 sector count, postgap sector count, and postgap type.
+    Postgap type can detect 4 common types or defaults to all zeros.
 - Audio track locations in the data tracks TOC are now compensated.
   Some games use these entries for fine audio control.
   The sector start address should change when the ISO grows / shrinks.
-  In the destination folder they appear as 0 byte reference files.
+  In the destination folder they appear as 0-byte reference files.
 - Y2K timestamps on the catalog/files/directories are now fully restorable.
-  Psxrip now has a --fix switch to override preservation and fix the
-  obvious broken dates instead.
-- Buggy/incomplete libcdio parsing of .cue file fixed (good enough).
-  Instead of defaulting to the same filename for both the .cue and .bin file
-  it now uses the parsed .cue data for the filename of the tracks.
+  Psxrip now has a -f --fix switch to override preservation and fix the
+  obviously broken dates instead.
+- Buggy/incomplete libcdio parsing of .cue file fixed (even better now).
+  Instead of defaulting to the same filename for both the .cue and .bin files
+  it now uses the parsed .cue data for the filenames of the tracks.
   The correct file will load when a sector gets read.
+  Also, a ton of logging has been put it to ensure that track information
+  stays consistent in libcdio / psxrip. Use -v --verbose to see the details.
+  Lots of issues and quirks of libcdio have been fixed.
 - Audio tracks are now fully extracted to the destination folder.
   For ease, they are converted to .wav files for playback and editing.
   They are also converted back to audio tracks when rebuilding the ISO.
+  Pregaps are saved separately as they are usually just silence.
+  Also keep the size the same; there is no compensation (yet)!
+  Audio tracks are inside the folder "_PSXRIP".
+- Rebuild multitrack ISO's will end up as a single .bin file instead of
+  having a .bin for each track.
+- Regular Audio / Data cd's can be ripped as well.
+  Rebuilding, however, is not possible due to differences in the filesystem.
+- Psxrip now has an argument -s or --strict. This mode will make sure
+  that on rebuild all the files are put back to their original locations.
+  If a file is larger, then it will remap the file to the end of track 1.
+  The original location will be zeroed out.
+  This mode is for when everything must stay at the same location due to
+  the way the game is written. Like direct sector access instead of TOC.
 
 ^Ripper
 

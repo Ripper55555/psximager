@@ -43,7 +43,7 @@ namespace fs = std::filesystem;
 using namespace std;
 
 
-#define TOOL_VERSION "PSXInject v2.2.5 (Win32 build by ^Ripper)"
+#define TOOL_VERSION "PSXInject v2.2.6 (Win32 build by ^Ripper)"
 
 
 // Print usage information and exit.
