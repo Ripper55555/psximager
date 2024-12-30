@@ -1381,7 +1381,6 @@ public:
 	void writeFromFlatList(const std::vector<FSNode*>& flatList)
 	{
 		for (auto* node : flatList) {
-			writeGap(node->firstSector);  // Ensure sectors are written in order
 			node->accept(*this);  // Call the appropriate visit method
 		}
 	}
